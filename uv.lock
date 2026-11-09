@@ -1095,7 +1095,7 @@ name = "titella-slave-assets"
 version = "1.0.0"
 source = { path = "vendor/titella_slave_assets-1.0.0-py3-none-any.whl" }
 wheels = [
-    { filename = "titella_slave_assets-1.0.0-py3-none-any.whl", hash = "sha256:ab4fda0c5f62447936353693e319ce20e2c4d84d11b1f820a38f9d544203bf55" },
+    { filename = "titella_slave_assets-1.0.0-py3-none-any.whl", hash = "sha256:ab14798596e96a787a2e24d1ee4a49c83f2422d83b0ad27618ae0f9b180fcdc9" },
 ]
 
 [[package]]
