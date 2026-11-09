@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "titella"
+version = "1.4.2"
+description = "KVM auditing rig on ESP32-S3: HID, UART, CDC and MCP"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "mcp>=1.30,<2",
+  "titella-slave-assets==1.0.0",
+  "tomli>=2; python_version < '3.11'",
+  "uvicorn>=0.30,<1",
+]
+
+[project.scripts]
+titella-mcp = "titella.stdio_proxy:main"
+titella-http = "titella.http_server:main"
+titella-probe = "titella.probe:main"
+
+# The slave payloads are consumed exclusively from the vendored
+# titella-slave-assets wheel; the master neither compiles nor embeds any
+# slave implementation source.
+[tool.uv.sources]
+titella-slave-assets = { path = "vendor/titella_slave_assets-1.0.0-py3-none-any.whl" }
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Canonical server documents travel inside the wheel and the sdist and are
+# read at run time with importlib.resources; they are never looked up in a
+# checkout or downloaded.
+[tool.setuptools.package-data]
+titella = ["_docs/*.md"]

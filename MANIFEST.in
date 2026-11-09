@@ -1,0 +1,12 @@
+# Master sdist: the vendored slave-assets wheel travels with the source so
+# that "pip install titella-1.4.2.tar.gz" resolves the exact dependency
+# without an external index. No absolute paths, no sibling checkouts.
+include pyproject.toml
+include README.md
+include uv.lock
+include MANIFEST.in
+include vendor/*.whl
+recursive-include src *.py
+recursive-include src *.md
+recursive-include tests *.py
+global-exclude __pycache__ *.py[cod] *.egg-info

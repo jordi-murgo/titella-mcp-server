@@ -1,0 +1,23 @@
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local packages and builds
+build/
+dist/
+*.elf
+*.bin
+*.map
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor and system artifacts
+.DS_Store
