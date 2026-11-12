@@ -14,12 +14,22 @@ from .config import Config
 STALE_CAPTURE_S = 120
 
 
+def _capture_source(config: Config) -> str:
+    """Where the last frame comes from: the UVC card or a desktop window."""
+    if config.transport == "window":
+        selector = config.window_app or config.window_title or config.window_id
+        return f"window:{selector}"
+    return config.screen_device
+
+
 def _capture_state(config: Config, resolution: tuple[int, int] | None, age_s: float | None) -> dict[str, Any]:
     state: dict[str, Any] = {
-        "source": config.screen_device,
+        "source": _capture_source(config),
         "input_format": config.screen_input_format,
         "pixel_format": config.screen_pixel_format,
         "framerate": config.screen_framerate,
+        "autocrop": config.screen_autocrop,
+        "ocr_configured": bool(config.ocr_endpoint and config.ocr_model),
         "resolution": list(resolution) if resolution else None,
         "last_frame_age_s": round(age_s, 1) if age_s is not None else None,
     }
@@ -29,6 +39,39 @@ def _capture_state(config: Config, resolution: tuple[int, int] | None, age_s: fl
 def _agent_step(config: Config, agent: dict[str, Any]) -> str:
     """Bootstrap guidance for the selected platform, never Linux-only advice."""
     platform = agent.get("platform") or config.slave_platform
+    if (
+        config.transport == "window"
+        and config.agent_protocol == "clipboard"
+        and platform in {None, "windows"}
+    ):
+        return (
+            "The slave agent is not running on the clipboard channel: verify the active "
+            "input source of the focused slave window with screen(), then "
+            "slave_bootstrap(owner, platform=\"windows\", layout=..., layout_confirmed=true) "
+            "types the stub into the window and stages the loader over the shared clipboard. "
+            "A missing or unconfirmed layout answers slave_layout_required or "
+            "slave_layout_unconfirmed before any keystroke. If it fails with "
+            "bootstrap_loader_timeout the stub never announced stage.ready: check that the "
+            "target console runs the typed stub, that the keyboard layout matches, and that "
+            "clipboard sharing between master and slave is enabled; request_timeout usually "
+            "means the clipboard round trip is slower than ack_timeout_s."
+        )
+    if config.slave_transport == "hid" and platform in {None, "windows"}:
+        # A HID failure is never a COM problem: this leg needs no port, no
+        # clipboard and no network, so the advice names what the HID loader
+        # actually depends on.
+        return (
+            "The Windows slave agent is not running on the HID transport: verify the active "
+            "input source of the operator-prepared console with screen(), acquire the lease, "
+            "then slave_bootstrap(owner, platform=\"windows\", layout=..., "
+            "layout_confirmed=true, skip_launch=true) stages the loader in the ESP32 Feature "
+            "mailbox and types only the stage-0 line. If it fails with "
+            "slave_transport_unsupported the flashed firmware predates the HID data protocol "
+            "(1.6.0+): reflash it instead of falling back. If it fails with "
+            "bootstrap_loader_timeout the prepared console received nothing or its layout "
+            "does not match; check PowerShell 5.1 with FullLanguage. No COM port participates "
+            "in this path."
+        )
     if platform == "windows":
         return (
             "The Windows slave agent is not running: verify the active input source of the "
@@ -81,18 +124,31 @@ def next_steps(
 ) -> list[str]:
     """Pending steps, in the order in which they must be resolved."""
     steps: list[str] = []
+    window_transport = config.transport == "window"
     if not firmware.get("reachable"):
-        steps.append(
-            "The ESP32 does not answer protocol v1: check TITELLA_TRANSPORT and the port "
-            f"({config.transport}). A chip in reset emits no banner; a firmware older than "
-            "envelope v1 replies without `v`."
-        )
+        if window_transport:
+            steps.append(
+                "The target macOS window is not open or not found: check window_app, "
+                "window_title or window_id, and confirm Screen Recording permission is granted."
+            )
+        else:
+            steps.append(
+                "The ESP32 does not answer protocol v1: check TITELLA_TRANSPORT and the port "
+                f"({config.transport}). A chip in reset emits no banner; a firmware older than "
+                "envelope v1 replies without `v`."
+            )
     if not lease.get("locked"):
         steps.append(
             "No client holds the HID lease: call lock_acquire(owner) before "
             "mouse_abs, mouse_rel, click, wheel, key, type or slave_bootstrap."
         )
-    if agent.get("status") != "ready":
+    # The window transport without an agent channel cannot run a bootstrap, so
+    # asking for one would be advice that cannot be followed; with the
+    # clipboard protocol the same step is exactly what is missing.
+    if agent.get("status") != "ready" and (
+        not window_transport
+        or config.agent_protocol in {"clipboard", "visual", "serial"}
+    ):
         steps.append(_agent_step(config, agent))
     if resolution is None:
         steps.append(
@@ -123,6 +179,11 @@ def diagnose(
         "firmware": firmware,
         "lease": lease,
         "agent": agent,
+        "agent_protocol": config.agent_protocol,
+        # The ESP32→slave leg is a separate selection from the master link and
+        # from the agent channel; status reports it so a HID failure is never
+        # read as a serial problem.
+        "slave_transport": config.slave_transport,
         "capture": _capture_state(config, resolution, capture_age_s),
         "next_steps": next_steps(
             config,

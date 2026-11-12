@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import hashlib
+import base64
 import errno
+import hashlib
 import os
 import pty
 import select
@@ -13,7 +14,12 @@ import time
 import unittest
 from pathlib import Path
 
-from titella.bootstrap import loader_source
+from titella.bootstrap import (
+    _hid_container,
+    _render_loader,
+    loader_source,
+    windows_hid_stage0_command,
+)
 from titella_slave_assets.bundles import load_bundle
 from titella_slave_assets.wire import (
     FIRMWARE_TO_SLAVE,
@@ -26,6 +32,104 @@ from titella_slave_assets.wire import (
 
 LINK = "0123456789abcdef0123456789abcdef"
 SESSION = "b" * 32
+
+# Inline fixture: the M suite must never read the slave checkout, and the
+# staged snapshot template lives there until the bundle carries it.
+STAGE0 = "$tok = '__HID_TOKEN__'\n$size = __HID_SIZE__\n$sha = '__HID_SHA256__'\n"
+WINDOWS_TEMPLATE = "P='__CDC_PORT__'\nH='__HID_TRANSPORT_SOURCE_B64__'\n"
+UNIT = "namespace Titella.Slave {\n  public sealed class HidByteStream { }\n}\n"
+BINDING = "HID:012345ABCDEF"
+
+
+class HidStage0CommandTests(unittest.TestCase):
+    def test_rejects_invalid_inputs(self) -> None:
+        sha = hashlib.sha256(b"loader").hexdigest()
+        cases = (
+            ("", "0123456789abcdef", 10, sha),
+            ("missing placeholders", "0123456789abcdef", 10, sha),
+            (STAGE0, "0123456789abcde", 10, sha),
+            (STAGE0, "0123456789abcdeg", 10, sha),
+            (STAGE0, "0123456789abcdef", 0, sha),
+            (STAGE0, "0123456789abcdef", 32769, sha),
+            (STAGE0, "0123456789abcdef", True, sha),
+            (STAGE0, "0123456789abcdef", 10, "0" * 63),
+            (STAGE0, "0123456789abcdef", 10, "z" * 64),
+        )
+        for source, token, size, digest in cases:
+            with self.subTest(token=token, size=size, digest=digest[:8]):
+                with self.assertRaises(ValueError):
+                    windows_hid_stage0_command(source, token, size, digest)
+
+    def test_rejects_a_template_missing_one_placeholder(self) -> None:
+        partial = STAGE0.replace("__HID_SHA256__", "fixed")
+        with self.assertRaises(ValueError):
+            windows_hid_stage0_command(partial, "0123456789abcdef", 10,
+                                       hashlib.sha256(b"x").hexdigest())
+
+
+class HidRenderTests(unittest.TestCase):
+    def test_binding_and_source_are_coupled_in_both_directions(self) -> None:
+        cases = (
+            ("windows-dotnet", BINDING, None, "requires hid_transport_source"),
+            ("windows-dotnet", "COM5", UNIT, "requires the HID"),
+            ("python", BINDING, UNIT, "windows-dotnet loader"),
+            ("windows-dotnet", "HID:012345abcdef", UNIT, "12 uppercase"),
+            ("windows-dotnet", BINDING, "  ", "non-empty"),
+        )
+        for implementation, port, source, message in cases:
+            with self.subTest(port=port, implementation=implementation):
+                with self.assertRaisesRegex(ValueError, message):
+                    _render_loader(WINDOWS_TEMPLATE, implementation, LINK, SESSION, port,
+                                   hid_transport_source=source)
+
+    def test_hid_source_is_rejected_when_the_template_carries_no_placeholder(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exactly one HID transport placeholder"):
+            _render_loader(
+                "P='__CDC_PORT__'", "windows-dotnet", LINK, SESSION, BINDING,
+                hid_transport_source=UNIT,
+            )
+
+    def test_hid_render_never_embeds_the_transport_unit(self) -> None:
+        """Container mode: the placeholder is rendered empty and the unit
+        travels only behind the marker, as raw UTF-8."""
+        rendered = _render_loader(
+            WINDOWS_TEMPLATE, "windows-dotnet", LINK, SESSION, BINDING,
+            hid_transport_source=UNIT,
+        )
+        self.assertNotIn(UNIT, rendered)
+        self.assertNotIn(base64.b64encode(UNIT.encode("utf-8")).decode("ascii"),
+                         rendered)
+        self.assertIn("''", rendered)
+
+    def test_hid_container_carries_exactly_one_marker(self) -> None:
+        rendered = _render_loader(
+            WINDOWS_TEMPLATE, "windows-dotnet", LINK, SESSION, BINDING,
+            hid_transport_source=UNIT,
+        )
+        container = _hid_container(rendered, UNIT)
+        self.assertEqual(container.count("#@#"), 1)
+        loader_part, _, unit_part = container.partition("#@#")
+        self.assertEqual(unit_part.strip(), UNIT.strip())
+        self.assertNotIn(UNIT, loader_part)
+
+    def test_hid_container_rejects_a_marker_in_either_half(self) -> None:
+        for loader_half, unit_half in (
+            ("P='x'\n#@#", UNIT),
+            (WINDOWS_TEMPLATE, "namespace X { }\n#@#"),
+        ):
+            with self.subTest(unit="#@#" in unit_half):
+                with self.assertRaisesRegex(ValueError, "container marker"):
+                    _hid_container(loader_half, unit_half)
+
+    def test_empty_hid_source_is_valid_with_the_precompiled_transport(self) -> None:
+        """A loader rendered with no embedded source is valid: stage-0
+        precompiles the unit, and Open-Hid accepts an empty HidSrc when
+        the type already exists."""
+        rendered = _render_loader(
+            WINDOWS_TEMPLATE, "windows-dotnet", LINK, SESSION, BINDING,
+            hid_transport_source=UNIT,
+        )
+        self.assertIn("H=''", rendered)
 
 
 class LoaderHarness:

@@ -21,20 +21,31 @@ _TITELLA_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 
 ENV_TO_KEY = {
     "TITELLA_TRANSPORT": "transport",
+    "TITELLA_AGENT_PROTOCOL": "agent_protocol",
     "TITELLA_SERIAL_PORT": "serial_port",
     "TITELLA_SERIAL_BAUD": "serial_baud",
     "TITELLA_WIFI_HOST": "wifi_host",
     "TITELLA_WIFI_PORT": "wifi_port",
+    "TITELLA_WINDOW_APP": "window_app",
+    "TITELLA_WINDOW_TITLE": "window_title",
+    "TITELLA_WINDOW_ACTIVATION": "window_activation",
+    "TITELLA_WINDOW_ID": "window_id",
     "TITELLA_SCREEN_DEVICE": "screen_device",
     "TITELLA_SCREEN_INPUT_FORMAT": "screen_input_format",
     "TITELLA_SCREEN_PIXEL_FORMAT": "screen_pixel_format",
     "TITELLA_SCREEN_FRAMERATE": "screen_framerate",
+    "TITELLA_SCREEN_AUTOCROP": "screen_autocrop",
+    "TITELLA_OCR_ENDPOINT": "ocr_endpoint",
+    "TITELLA_OCR_API_KEY": "ocr_api_key",
+    "TITELLA_OCR_MODEL": "ocr_model",
+    "TITELLA_OCR_TIMEOUT_S": "ocr_timeout_s",
     "TITELLA_STATE_DIR": "state_dir",
     "TITELLA_KEYBOARD_LAYOUT": "keyboard_layout",
     "TITELLA_HEARTBEAT_S": "heartbeat_s",
     "TITELLA_DISCONNECT_GRACE_S": "disconnect_grace_s",
     "TITELLA_HTTP_PORT": "http_port",
     "TITELLA_SLAVE_PLATFORM": "slave_platform",
+    "TITELLA_SLAVE_TRANSPORT": "slave_transport",
     "TITELLA_SLAVE_CDC_PORT": "slave_cdc_port",
     "TITELLA_TERMINAL_MODS": "terminal_mods",
     "TITELLA_TERMINAL_KEY": "terminal_key",
@@ -44,16 +55,27 @@ ENV_TO_KEY = {
 
 _INSTANCE_KEYS = frozenset({
     "transport",
+    "agent_protocol",
     "serial_port",
     "serial_baud",
     "wifi_host",
     "wifi_port",
+    "window_app",
+    "window_title",
+    "window_activation",
+    "window_id",
     "screen_device",
     "screen_input_format",
     "screen_pixel_format",
     "screen_framerate",
+    "screen_autocrop",
+    "ocr_endpoint",
+    "ocr_api_key",
+    "ocr_model",
+    "ocr_timeout_s",
     "keyboard_layout",
     "slave_platform",
+    "slave_transport",
     "slave_cdc_port",
     "terminal_mods",
     "terminal_key",
@@ -78,17 +100,47 @@ def validate_titella_id(value: Any) -> str:
 
 @dataclass(frozen=True)
 class Config:
-    # Master→ESP32 transport: UART ("serial") or TCP over the SoftAP ("wifi").
+    # Master→ESP32 transport: UART ("serial"), TCP over the SoftAP ("wifi")
+    # or a desktop window on the master itself ("window").
     # Port autodetection and the DTR/RTS lines only apply to serial.
     transport: str = "serial"
+    # Slave-agent channel: "serial" (the CDC device of the rig), "clipboard"
+    # (the shared clipboard of the window transport), "visual" (reserved) or
+    # "none". Without an explicit value the window transport defaults to
+    # "none" (screen and HID only) and every other transport to "serial".
+    agent_protocol: str = "serial"
     serial_port: str | None = None
     wifi_host: str = "192.168.4.1"
     wifi_port: int = 5555
+    # Window transport ("window"): a desktop window on the master's own macOS
+    # session is the simulated slave. The window is selected by application
+    # name (kCGWindowOwnerName), window title (kCGWindowName) or an explicit
+    # CGWindowID; at least one is required and every configured selector must
+    # match, so an ambiguous title cannot silently drive another window.
+    window_app: str | None = None
+    window_title: str | None = None
+    # How the target window is brought into play before an action:
+    # "quiet" (default) delivers every event straight to the process and never
+    # steals the operator's frontmost application; "raise" activates the window
+    # like a remote-desktop client would.
+    window_activation: str = "quiet"
+    window_id: int | None = None
     # HDMI→USB capture device connected to the master; capture is local.
     screen_device: str = "USB3 Video"
     screen_input_format: str = ""      # empty = avfoundation on macOS, v4l2 on Linux
     screen_pixel_format: str = "uyvy422"
     screen_framerate: int = 30
+    # UVC frames are cropped to the active content box when pillarbox or
+    # letterbox black borders are detected; an all-black frame is never
+    # cropped, so a "no signal" capture stays visible as a black image.
+    screen_autocrop: bool = True
+    # OpenAI-compatible chat-completions endpoint used by screen_ocr. The
+    # model must be one served locally; the API key is never reported in
+    # plaintext (summary exposes ocr_api_key_configured instead).
+    ocr_endpoint: str | None = None
+    ocr_api_key: str | None = None
+    ocr_model: str | None = None
+    ocr_timeout_s: float = 30.0
     state_dir: Path = Path(tempfile.gettempdir()) / "titella"
     keyboard_layout: str = "es_ES"
     heartbeat_s: float = 5.0
@@ -100,6 +152,14 @@ class Config:
     slave_platform: str | None = None
     # Native CDC device of the slave; when unset the loader probes its own OS.
     slave_cdc_port: str | None = None
+    # Channel between the ESP32 and the Windows slave the bootstrap drives:
+    # "cdc" (the native CDC device, opened by the loader) or "hid" (the
+    # generic USB HID IN/OUT collection plus the Feature 0x11 snapshot, which
+    # needs no port, clipboard or network on the target). The master→ESP32
+    # link is always the UART; this selects the ESP32→slave leg only. "hid"
+    # requires transport="serial", agent_protocol="serial" and a Windows
+    # slave with no CDC port pinned.
+    slave_transport: str = "cdc"
     # Optional launcher overrides for the configured default slave platform,
     # or for Linux where no portable terminal shortcut exists. An explicitly
     # selected macOS or Windows target uses its built-in profile so a shortcut
@@ -107,7 +167,9 @@ class Config:
     terminal_mods: tuple[str, ...] | None = None
     terminal_key: str | None = None
     launcher_text: str | None = None
-    serial_baud: int = 115200
+    # The UART to the ESP32 runs at 2,000,000 baud with every current
+    # firmware; 115200 belonged to the historical defaults and mismatches it.
+    serial_baud: int = 2_000_000
     ack_timeout_s: float = 1.0
     ack_retries: int = 3
     titella_id: str = DEFAULT_TITELLA_ID
@@ -186,6 +248,28 @@ def _integer(value: Any, name: str, minimum: int, maximum: int) -> int:
     return parsed
 
 
+def _boolean(value: Any, name: str) -> bool:
+    """Parses a boolean from a TOML bool or an environment string."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+    raise ValueError(f"{name} must be a boolean")
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _build_single_config(
     values: Mapping[str, Any],
     *,
@@ -199,17 +283,41 @@ def _build_single_config(
     if layout not in {"es_ES", "en_US"}:
         raise ValueError("keyboard_layout must be es_ES or en_US")
     transport = str(values.get("transport", "serial")).strip().lower()
-    if transport not in {"serial", "wifi"}:
-        raise ValueError("transport must be serial or wifi")
+    if transport not in {"serial", "wifi", "window"}:
+        raise ValueError("transport must be serial, wifi or window")
+    # The slave-agent channel is validated whenever it is explicit. When it is
+    # absent the transport decides: the window transport has no CDC device, so
+    # it stays at "none" (screen and HID only) unless the shared clipboard
+    # channel is configured explicitly.
+    raw_agent_protocol = values.get("agent_protocol")
+    if raw_agent_protocol is None:
+        agent_protocol = "none" if transport == "window" else "serial"
+    else:
+        agent_protocol = str(raw_agent_protocol).strip().lower()
+        if agent_protocol not in {"serial", "clipboard", "visual", "none"}:
+            raise ValueError("agent_protocol must be serial, clipboard, visual or none")
     # The TCP port is always validated: an impossible value is a configuration
     # error even when the active transport is serial.
     wifi_port = _integer(values.get("wifi_port", 5555), "wifi_port", 1, 65535)
     wifi_host = str(values.get("wifi_host", "192.168.4.1")).strip()
     if transport == "wifi" and not wifi_host:
         raise ValueError("wifi_host cannot be empty with transport=wifi")
+    # Window selectors are optional in general (they only matter for the
+    # window transport) and every one that is present is validated: a
+    # CGWindowID outside the 32-bit signed range can never exist.
+    window_app = _optional_text(values.get("window_app"))
+    window_title = _optional_text(values.get("window_title"))
+    window_activation = str(values.get("window_activation", "quiet")).strip().lower()
+    if window_activation not in {"quiet", "raise"}:
+        raise ValueError("window_activation must be quiet or raise")
+    window_id: int | None = None
+    if values.get("window_id") is not None and str(values.get("window_id")).strip():
+        window_id = _integer(values.get("window_id"), "window_id", 1, 2_147_483_647)
+    if transport == "window" and window_id is None and not window_app and not window_title:
+        raise ValueError("window_app, window_title or window_id is required with transport=window")
     heartbeat = _number(values.get("heartbeat_s", 5), "heartbeat_s", 1, 60)
     grace = _number(values.get("disconnect_grace_s", 30), "disconnect_grace_s", heartbeat, 600)
-    ack_timeout = _number(values.get("ack_timeout_s", 1), "ack_timeout_s", 0.1, 10)
+    ack_timeout = _number(values.get("ack_timeout_s", 1), "ack_timeout_s", 0.1, 30)
     ack_retries = int(values.get("ack_retries", 3))
     if not 0 <= ack_retries <= 10:
         raise ValueError("ack_retries must be between 0 and 10")
@@ -217,7 +325,7 @@ def _build_single_config(
     serial_port = values.get("serial_port")
     if serial_port is not None:
         serial_port = str(serial_port).strip() or None
-    serial_baud = _integer(values.get("serial_baud", 115200), "serial_baud", 1, 5_000_000)
+    serial_baud = _integer(values.get("serial_baud", 2_000_000), "serial_baud", 1, 5_000_000)
 
     # The slave platform is a hard selection, never inferred from the master.
     # An invalid value is a configuration error even before any bootstrap runs.
@@ -228,6 +336,13 @@ def _build_single_config(
             slave_platform = None
         elif slave_platform not in {"macos", "linux", "windows"}:
             raise ValueError("slave_platform must be macos, linux or windows")
+    # The ESP32→slave channel is a hard selection too. Its contradictions are
+    # rejected here, before a connection exists: a HID bootstrap that only
+    # discovers "transport=window" or a pinned COM after connecting has
+    # already typed at the wrong target.
+    slave_transport = str(values.get("slave_transport", "cdc")).strip().lower()
+    if slave_transport not in {"cdc", "hid"}:
+        raise ValueError("slave_transport must be cdc or hid")
     slave_cdc_port = values.get("slave_cdc_port")
     if slave_cdc_port is not None:
         slave_cdc_port = str(slave_cdc_port).strip() or None
@@ -237,6 +352,15 @@ def _build_single_config(
         and re.fullmatch(r"COM[1-9][0-9]*", slave_cdc_port) is None
     ):
         raise ValueError("slave_cdc_port must match COM[1-9][0-9]* on windows")
+    if slave_transport == "hid":
+        if transport != "serial":
+            raise ValueError("slave_transport=hid requires transport=serial")
+        if agent_protocol != "serial":
+            raise ValueError("slave_transport=hid requires agent_protocol=serial")
+        if slave_platform != "windows":
+            raise ValueError("slave_transport=hid requires slave_platform=windows")
+        if slave_cdc_port is not None:
+            raise ValueError("slave_transport=hid cannot carry slave_cdc_port")
 
     # Launcher fields stay optional: None defers to the platform profile, an
     # explicit empty string (launcher_text="") is authoritative.
@@ -261,21 +385,37 @@ def _build_single_config(
     if not screen_pixel_format:
         raise ValueError("screen_pixel_format cannot be empty")
     screen_framerate = _integer(values.get("screen_framerate", 30), "screen_framerate", 1, 240)
+    screen_autocrop = _boolean(values.get("screen_autocrop", True), "screen_autocrop")
+    ocr_endpoint = _optional_text(values.get("ocr_endpoint"))
+    ocr_api_key = _optional_text(values.get("ocr_api_key"))
+    ocr_model = _optional_text(values.get("ocr_model"))
+    ocr_timeout_s = _number(values.get("ocr_timeout_s", 30), "ocr_timeout_s", 0.1, 600)
     return Config(
         transport=transport,
+        agent_protocol=agent_protocol,
         serial_port=serial_port,
         wifi_host=wifi_host,
         wifi_port=wifi_port,
+        window_app=window_app,
+        window_title=window_title,
+        window_activation=window_activation,
+        window_id=window_id,
         screen_device=screen_device,
         screen_input_format=screen_input_format,
         screen_pixel_format=screen_pixel_format,
         screen_framerate=screen_framerate,
+        screen_autocrop=screen_autocrop,
+        ocr_endpoint=ocr_endpoint,
+        ocr_api_key=ocr_api_key,
+        ocr_model=ocr_model,
+        ocr_timeout_s=ocr_timeout_s,
         state_dir=state_dir,
         keyboard_layout=layout,
         heartbeat_s=heartbeat,
         disconnect_grace_s=grace,
         http_port=http_port,
         slave_platform=slave_platform,
+        slave_transport=slave_transport,
         slave_cdc_port=slave_cdc_port,
         terminal_mods=terminal_mods,
         terminal_key=terminal_key,
@@ -411,16 +551,27 @@ def save_titella_config(
         "disconnect_grace_s",
         "default_titella",
         "transport",
+        "agent_protocol",
         "serial_port",
         "serial_baud",
         "wifi_host",
         "wifi_port",
+        "window_app",
+        "window_title",
+        "window_activation",
+        "window_id",
         "screen_device",
         "screen_input_format",
         "screen_pixel_format",
         "screen_framerate",
+        "screen_autocrop",
+        "ocr_endpoint",
+        "ocr_api_key",
+        "ocr_model",
+        "ocr_timeout_s",
         "keyboard_layout",
         "slave_platform",
+        "slave_transport",
         "slave_cdc_port",
         "terminal_mods",
         "terminal_key",
@@ -441,16 +592,27 @@ def save_titella_config(
 
     ordered_instance_keys = (
         "transport",
+        "agent_protocol",
         "serial_port",
         "serial_baud",
         "wifi_host",
         "wifi_port",
+        "window_app",
+        "window_title",
+        "window_activation",
+        "window_id",
         "screen_device",
         "screen_input_format",
         "screen_pixel_format",
         "screen_framerate",
+        "screen_autocrop",
+        "ocr_endpoint",
+        "ocr_api_key",
+        "ocr_model",
+        "ocr_timeout_s",
         "keyboard_layout",
         "slave_platform",
+        "slave_transport",
         "slave_cdc_port",
         "terminal_mods",
         "terminal_key",

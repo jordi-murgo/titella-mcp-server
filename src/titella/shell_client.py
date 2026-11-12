@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
-from .agent_state import AgentGate
+from .agent_state import AgentGate, require_cdc_channel
 from .serial_link import SerialLink, TransportError
 from titella_slave_assets.wire import decode_data
 
@@ -159,6 +159,7 @@ class ShellClient:
         return True
 
     def remote_shell(self, cmd: str, sync_timeout: float = 10, timeout: float = 60, cwd: str | None = None) -> dict[str, Any]:
+        require_cdc_channel(self.link)
         self.gate.require()
         job_id = uuid.uuid4().hex
         job = JobState(job_id)
@@ -210,6 +211,7 @@ class ShellClient:
         return dict(response.get("body") or {})
 
     def terminal_open(self, cwd: str | None, shell: str | None, rows: int, cols: int, idle_timeout: int) -> dict[str, Any]:
+        require_cdc_channel(self.link)
         self.gate.require()
         response = self.link.request("shell", "terminal.open", {"cwd": cwd, "shell": shell, "rows": rows, "cols": cols, "idle_timeout": idle_timeout})
         body = dict(response.get("body") or {})

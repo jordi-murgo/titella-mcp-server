@@ -13,12 +13,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .agent_state import AgentGate
+from .agent_state import AgentGate, require_cdc_channel
+from .screen import png_resolution
 from .serial_link import SerialLink, TransportError
 from titella_slave_assets.wire import DATA_CHUNK_BYTES, DATA_WINDOW_DEFAULT, DATA_WINDOW_MAX, decode_data
 
 MAX_CONVENIENCE_WRITE = 64 * 1024
 MAX_TRANSFER_BYTES = 512 * 1024 * 1024
+
+# fs.screen: one still image of the primary monitor of a running agent. The
+# metadata request keeps the ordinary 65 s ceiling, so the server-side worst
+# case is request plus stream, never an unbounded wait.
+SCREEN_STREAM_TIMEOUT_S = 180.0
+SCREEN_MAX_PAYLOAD_BYTES = 32 * 1024 * 1024
+SCREEN_LIMIT_ERROR = (
+    "screen_too_large",
+    f"the agent capture exceeds the {SCREEN_MAX_PAYLOAD_BYTES} byte receiver bound",
+)
 
 
 def _validated_window(window: int) -> int:
@@ -33,6 +44,57 @@ class StreamCollector:
     payload: bytearray = field(default_factory=bytearray)
     result: dict[str, Any] = field(default_factory=dict)
     done: threading.Event = field(default_factory=threading.Event)
+    limit: int | None = None
+    limit_error: tuple[str, str] | None = None
+    error: dict[str, Any] | None = None
+    # windowed streams arrive with per-block ACKs and may interleave; ordered
+    # reassembly needs the pending blocks and the next expected sequence.
+    ordered: bool = False
+    next_seq: int = 0
+    pending: dict[int, bytes] = field(default_factory=dict)
+
+    def fail(self, code: str, message: str, retryable: bool, **context: Any) -> None:
+        """Records the first failure; a later event never overwrites it."""
+        if self.error is None:
+            self.error = {"code": code, "message": message, "retryable": retryable, **context}
+        self.done.set()
+
+    def accept(self, seq: int, data: bytes) -> bool:
+        """Appends one block in sequence order; False only when the bound is hit.
+
+        A windowed sender does not wait for each ACK, so blocks arrive out of
+        order, repeated and sometimes lost. Refusing a block does not help: the
+        refusal costs an unacknowledged frame, the sender resends, and the
+        extra traffic overruns the ESP32 line buffer, which truncates frames.
+        Everything is therefore acknowledged and held, and a lost block is
+        recovered by the sender's own bounded retransmit; the hold is bounded
+        by the payload cap, so memory cannot grow past it.
+        """
+        if seq < self.next_seq:
+            # Already applied: acknowledge again without rewriting bytes.
+            return True
+        if seq in self.pending:
+            return True
+        if seq == self.next_seq:
+            if not self._append(data):
+                return False
+            self.next_seq += 1
+            while self.next_seq in self.pending:
+                block = self.pending.pop(self.next_seq)
+                if not self._append(block):
+                    return False
+                self.next_seq += 1
+            return True
+        self.pending[seq] = data
+        return True
+
+    def _append(self, data: bytes) -> bool:
+        if self.limit is not None and len(self.payload) + len(data) > self.limit:
+            code, message = self.limit_error or ("stream_too_large", "stream exceeds its bound")
+            self.fail(code, message, False)
+            return False
+        self.payload.extend(data)
+        return True
 
 
 @dataclass
@@ -89,7 +151,21 @@ class FilesClient:
         if collector is None:
             return False
         if frame["type"] == "data":
-            collector.payload.extend(decode_data(frame))
+            if collector.error is not None:
+                # Abandoned stream: no further bytes are accepted or
+                # acknowledged, so the sender exits its bounded retry loop.
+                return False
+            data = decode_data(frame)
+            if collector.ordered:
+                # Windowed screen stream: blocks arrive out of order and are
+                # reassembled by seq; the size bound is enforced per append.
+                return collector.accept(int(frame["seq"]), data)
+            if collector.limit is not None and len(collector.payload) + len(data) > collector.limit:
+                # Enforced while receiving, never after assembling the buffer.
+                code, message = collector.limit_error or ("stream_too_large", "stream exceeds its bound")
+                collector.fail(code, message, False, session_id=session_id)
+                return False
+            collector.payload.extend(data)
         elif frame["type"] == "event" and frame.get("op") == "fs.stream.finished":
             collector.result = dict(frame.get("body") or {})
             collector.done.set()
@@ -127,10 +203,22 @@ class FilesClient:
                 transfer.remote_done.set()
         return True
 
-    def _request(self, op: str, **body: Any) -> dict[str, Any]:
+    def _request(
+        self,
+        op: str,
+        *,
+        stream_timeout: float = 65,
+        max_payload_bytes: int | None = None,
+        limit_error: tuple[str, str] | None = None,
+        ordered: bool = False,
+        **body: Any,
+    ) -> dict[str, Any]:
+        require_cdc_channel(self.link)
         self.gate.require()
         stream_id = uuid.uuid4().hex
-        collector = StreamCollector()
+        collector = StreamCollector(
+            limit=max_payload_bytes, limit_error=limit_error, ordered=ordered,
+        )
         with self._lock:
             self._streams[stream_id] = collector
         try:
@@ -139,8 +227,20 @@ class FilesClient:
             payload_kind = result.get("payload_kind")
             if payload_kind not in {"bytes", "json"}:
                 return result
-            if not collector.done.wait(65):
+            if not self._wait_stream(collector, stream_timeout, bounded=max_payload_bytes is not None):
+                if collector.error is not None:
+                    error = collector.error
+                    raise TransportError(
+                        str(error["code"]), str(error["message"]),
+                        bool(error["retryable"]), session_id=stream_id,
+                    )
                 raise TransportError("stream_timeout", f"timeout receiving fs.{op}", True, session_id=stream_id)
+            if collector.error is not None:
+                error = collector.error
+                raise TransportError(
+                    str(error["code"]), str(error["message"]),
+                    bool(error["retryable"]), session_id=stream_id,
+                )
             if collector.result.get("status") != "finished":
                 raise TransportError(
                     str(collector.result.get("code", "stream_failed")),
@@ -151,10 +251,34 @@ class FilesClient:
             if payload_kind == "json":
                 return json.loads(bytes(collector.payload).decode("utf-8"))
             result["_bytes"] = bytes(collector.payload)
+            if max_payload_bytes is not None:
+                # The final event carries its own count; the caller compares
+                # it with the received bytes instead of trusting one side.
+                result["_stream_event"] = dict(collector.result)
             return result
         finally:
             with self._lock:
                 self._streams.pop(stream_id, None)
+
+    def _wait_stream(self, collector: StreamCollector, timeout: float, *, bounded: bool) -> bool:
+        """Waits for the completion event; a bounded wait also aborts on link loss."""
+        if not bounded:
+            return collector.done.wait(timeout)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if collector.done.wait(min(remaining, 1.0)):
+                return True
+            # A known link loss must not be answered with a 180 s wait: the
+            # collector is failed and the caller maps agent_not_ready.
+            if collector.error is None and not self.gate.ready:
+                collector.fail(
+                    "agent_not_ready",
+                    "the slave agent stopped being reachable during fs.screen",
+                    True,
+                )
 
     def read(self, path: str, offset: int = 0, length: int = 32768, encoding: str = "utf-8") -> dict[str, Any]:
         result = self._request("read", path=path, offset=offset, length=length)
@@ -211,6 +335,88 @@ class FilesClient:
     def sysinfo(self) -> dict[str, Any]:
         return self._request("sysinfo")
 
+    def screen(self) -> dict[str, Any]:
+        """One still PNG of the agent's primary monitor.
+
+        The receiver bounds the stream at 32 MiB while collecting and gives
+        the transfer 180 s after the ordinary 65 s metadata request. Every
+        inconsistency is an error: nothing partial reaches the caller.
+        """
+        try:
+            result = self._request(
+                "screen",
+                stream_timeout=SCREEN_STREAM_TIMEOUT_S,
+                max_payload_bytes=SCREEN_MAX_PAYLOAD_BYTES,
+                limit_error=SCREEN_LIMIT_ERROR,
+                ordered=True,
+            )
+        except TransportError as exc:
+            if exc.code == "unknown_op":
+                raise TransportError(
+                    "screen_unsupported",
+                    "the running slave implementation has no agent screen capture; "
+                    "redeploy an agent that supports fs.screen (Windows, macOS or "
+                    "a Linux desktop with X11 or a Wayland portal)",
+                    False,
+                    session_id=exc.context.get("session_id"),
+                ) from exc
+            raise
+        image = result.pop("_bytes", None)
+        if not isinstance(image, bytes):
+            raise TransportError(
+                "invalid_screen_capture",
+                "the agent answered fs.screen without a byte stream",
+                False,
+            )
+        if result.get("payload_kind") != "bytes":
+            raise TransportError(
+                "invalid_screen_capture",
+                f"fs.screen returned payload_kind={result.get('payload_kind')!r}",
+                False,
+            )
+        if str(result.get("format", "")).lower() != "png":
+            raise TransportError(
+                "invalid_screen_capture",
+                f"fs.screen returned format={result.get('format')!r}",
+                False,
+            )
+        resolution = png_resolution(image)
+        if resolution is None:
+            raise TransportError(
+                "invalid_screen_capture",
+                "fs.screen returned bytes that are not a valid PNG",
+                False,
+            )
+        declared = result.get("bytes")
+        if not isinstance(declared, int) or isinstance(declared, bool) or declared != len(image):
+            # A short payload is a truncated transfer, not a bad image: the
+            # link lost bytes under load. It is retryable and never published.
+            raise TransportError(
+                "screen_capture_failed",
+                f"the fs.screen transfer was truncated: {declared!r} bytes declared, "
+                f"{len(image)} received",
+                True,
+            )
+        event = result.pop("_stream_event", None) or {}
+        if event.get("bytes") != len(image):
+            raise TransportError(
+                "screen_capture_failed",
+                f"the fs.screen final event reported {event.get('bytes')!r} bytes but "
+                f"{len(image)} arrived: the transfer was truncated",
+                True,
+            )
+        width, height = resolution
+        if result.get("width_px") != width or result.get("height_px") != height:
+            raise TransportError(
+                "invalid_screen_capture",
+                f"fs.screen declared {result.get('width_px')}x{result.get('height_px')} "
+                f"but the PNG is {width}x{height}",
+                False,
+            )
+        result["_image"] = image
+        result["_resolution"] = resolution
+        return result
+
     def upload(
         self,
         local_path: str,
@@ -218,6 +424,7 @@ class FilesClient:
         sync_timeout: float = 10,
         window: int = DATA_WINDOW_DEFAULT,
     ) -> dict[str, Any]:
+        require_cdc_channel(self.link)
         self.gate.require()
         window = _validated_window(window)
         source = Path(local_path).expanduser()
@@ -297,6 +504,7 @@ class FilesClient:
         sync_timeout: float = 10,
         window: int = DATA_WINDOW_DEFAULT,
     ) -> dict[str, Any]:
+        require_cdc_channel(self.link)
         self.gate.require()
         window = _validated_window(window)
         destination = Path(local_path).expanduser()

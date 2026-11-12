@@ -55,7 +55,7 @@ class ConfigTests(unittest.TestCase):
                 2000000,
             )
             missing = root / "absent.toml"
-            self.assertEqual(load_config(missing, {}).serial_baud, 115200)
+            self.assertEqual(load_config(missing, {}).serial_baud, 2000000)
 
     def test_rejects_invalid_serial_baud(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -156,6 +156,60 @@ class ConfigTests(unittest.TestCase):
                     "TITELLA_SLAVE_PLATFORM": "windows",
                     "TITELLA_SLAVE_CDC_PORT": value,
                 })
+
+    def test_slave_transport_defaults_to_cdc_and_follows_env_and_toml(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            missing = root / "absent.toml"
+            self.assertEqual(load_config(missing, {}).slave_transport, "cdc")
+            config_path = root / "config.toml"
+            config_path.write_text(
+                'slave_platform = "windows"\nslave_transport = "hid"\n',
+                encoding="utf-8",
+            )
+            from_toml = load_config(config_path, {})
+            self.assertEqual(from_toml.slave_transport, "hid")
+            from_env = load_config(config_path, {
+                "TITELLA_SLAVE_TRANSPORT": "CDC",
+            })
+            self.assertEqual(from_env.slave_transport, "cdc")
+
+    def test_rejects_unknown_slave_transport(self) -> None:
+        for value in ("usb", "serial", ""):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "slave_transport"):
+                load_config(environ={"TITELLA_SLAVE_TRANSPORT": value})
+
+    def test_hid_transport_rejects_contradictory_configuration(self) -> None:
+        # Every contradiction is a configuration error before a connection
+        # exists: a HID bootstrap that only discovers it after connecting has
+        # already typed at the wrong target.
+        cases = (
+            ({"TITELLA_SLAVE_TRANSPORT": "hid"}, "slave_platform=windows"),
+            ({"TITELLA_SLAVE_TRANSPORT": "hid", "TITELLA_TRANSPORT": "wifi"},
+             "transport=serial"),
+            ({"TITELLA_SLAVE_TRANSPORT": "hid", "TITELLA_TRANSPORT": "window",
+              "TITELLA_WINDOW_APP": "Citrix Viewer"}, "transport=serial"),
+            ({"TITELLA_SLAVE_TRANSPORT": "hid", "TITELLA_AGENT_PROTOCOL": "clipboard"},
+             "agent_protocol=serial"),
+            ({"TITELLA_SLAVE_TRANSPORT": "hid", "TITELLA_SLAVE_PLATFORM": "macos"},
+             "slave_platform=windows"),
+            ({"TITELLA_SLAVE_TRANSPORT": "hid", "TITELLA_SLAVE_PLATFORM": "windows",
+              "TITELLA_SLAVE_CDC_PORT": "COM5"}, "slave_cdc_port"),
+        )
+        for environ, message in cases:
+            with self.subTest(environ=environ):
+                with self.assertRaisesRegex(ValueError, message):
+                    load_config(environ=environ)
+
+    def test_hid_transport_accepts_the_full_selection(self) -> None:
+        config = load_config(environ={
+            "TITELLA_SLAVE_TRANSPORT": "hid",
+            "TITELLA_SLAVE_PLATFORM": "windows",
+        })
+        self.assertEqual(config.slave_transport, "hid")
+        self.assertEqual(config.transport, "serial")
+        self.assertEqual(config.agent_protocol, "serial")
+        self.assertIsNone(config.slave_cdc_port)
 
     def test_launcher_fields_stay_optional_and_an_empty_text_is_authoritative(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

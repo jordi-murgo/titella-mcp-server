@@ -2,8 +2,37 @@
 from __future__ import annotations
 
 import threading
+from typing import Any
 
 from .serial_link import TransportError
+
+
+def require_cdc_channel(link: Any) -> None:
+    """Rejects remote operations on a transport without an agent channel.
+
+    The channel the slave agent speaks over is the ``agent_protocol`` of the
+    link: ``serial`` (the CDC device of a physical rig), ``clipboard`` (the
+    shared clipboard of the window transport, packetised as M2S/S2M frames) or
+    ``none``/``visual`` (not available). Links that predate the field carry
+    their channel natively, so a missing attribute never rejects anything.
+    """
+    protocol = getattr(link, "agent_protocol", None)
+    if protocol is None or protocol == "serial":
+        return
+    if protocol == "clipboard":
+        return
+    if protocol == "visual":
+        raise TransportError(
+            "cdc_unavailable",
+            "visual agent_protocol is not implemented yet; use agent_protocol='clipboard'",
+            False,
+        )
+    raise TransportError(
+        "cdc_unavailable",
+        "window transport has no CDC channel with agent_protocol=none; "
+        "set agent_protocol='clipboard' to enable the slave agent",
+        False,
+    )
 
 
 class AgentGate:

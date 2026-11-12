@@ -63,6 +63,20 @@ class FirmwareInfoTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(link.calls, 1)
 
+    def test_forwards_the_slave_transport_fields_from_health(self) -> None:
+        # A HID bootstrap decides from these fields; dropping them in the
+        # snapshot would force a second query and could read a stale chip.
+        body = {
+            "firmware": "1.6.0", "protocol": 1, "uart_baud": 2000000,
+            "slave_transports": ["cdc", "hid"], "slave_transport": "cdc",
+            "hid_data_protocol": 1, "usb_vid": 6127, "usb_pid": 41871,
+            "usb_serial": "012345ABCDEF",
+        }
+        snapshot = FirmwareInfo(FakeLink(body)).snapshot()  # type: ignore[arg-type]
+        for field in ("slave_transports", "slave_transport", "hid_data_protocol",
+                      "usb_vid", "usb_pid", "usb_serial"):
+            self.assertEqual(snapshot[field], body[field], field)
+
     def test_unreachable_transport_is_reported_without_raising(self) -> None:
         link = FakeLink(error=TransportError("request_timeout", "timeout en hid.health", True))
         snapshot = FirmwareInfo(link).snapshot()  # type: ignore[arg-type]

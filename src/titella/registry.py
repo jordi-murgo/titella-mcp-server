@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -13,10 +14,13 @@ from typing import Any, Callable, Mapping
 
 from .agent_state import AgentGate
 from .bootstrap import BootstrapManager
+from .capability_prober import CapabilityProber
 from .config import (
     DEFAULT_TITELLA_ID,
     Config,
     _INSTANCE_KEYS,
+    _build_single_config,
+    _integer,
     _read_raw_toml,
     _split_document,
     instance_state_dir,
@@ -31,6 +35,7 @@ from .hid import HidController, HidLease
 from .screen import ScreenCapture
 from .serial_link import SerialLink, TransportError
 from .shell_client import ShellClient
+from .window_link import WindowLink
 
 # Known USB vendor IDs for Titella master/native bridges:
 # 0x1A86 = QinHeng / WCH (UART programming bridge)
@@ -45,17 +50,28 @@ class TitellaInstance:
         self,
         config: Config,
         *,
-        link: SerialLink | None = None,
+        link: Any | None = None,
         firmware: FirmwareInfo | None = None,
     ) -> None:
         self.config = config
         self.titella_id = config.titella_id
         self._seed_state_dir_if_migrating(config)
-        self.serial = link or SerialLink(config)
+        if link is not None:
+            self.serial = link
+        elif config.transport == "window":
+            # The window transport drives a desktop window on this machine: it
+            # has no serial port to discover and no reader/writer threads.
+            self.serial = WindowLink(config)
+        else:
+            self.serial = SerialLink(config)
         self.firmware = firmware or FirmwareInfo(self.serial)
-        self.capture = ScreenCapture(config)
+        self.capture = ScreenCapture(
+            config, window_link=self.serial if config.transport == "window" else None
+        )
         self.lease = HidLease(config)
-        self.hid = HidController(self.serial, self.lease, self.capture)
+        self.hid = HidController(
+            self.serial, self.lease, self.capture, layout=config.keyboard_layout
+        )
         self.gate = AgentGate()
         self.bootstrap = BootstrapManager(config, self.serial, self.hid, self.gate)
         self._bind_lock = threading.Lock()
@@ -65,17 +81,22 @@ class TitellaInstance:
         )
 
         self.serial.subscribe("control", self._attach)
-        if link is None:
-            threading.Thread(
-                target=self._reattach,
-                name=f"agent-reattach-{self.titella_id}",
-                daemon=True,
-            ).start()
-        else:
-            self._reattach()
+        if config.transport != "window":
+            # Only a rig with a firmware control channel can carry a live
+            # agent; a window instance has nothing to bind and no thread to
+            # start.
+            if link is None:
+                threading.Thread(
+                    target=self._reattach,
+                    name=f"agent-reattach-{self.titella_id}",
+                    daemon=True,
+                ).start()
+            else:
+                self._reattach()
 
         self.shells = ShellClient(self.serial, self.gate)
         self.files = FilesClient(self.serial, self.gate)
+        self.capabilities = CapabilityProber()
 
     @staticmethod
     def _seed_state_dir_if_migrating(config: Config) -> None:
@@ -143,7 +164,13 @@ class TitellaInstance:
         self._bind_live_agent()
 
     def reload_non_transport(self, new_config: Config) -> None:
-        """Updates screen/launcher/platform fields without closing the transport."""
+        """Updates screen/launcher/platform fields without closing the transport.
+
+        The tracked HID layout is deliberately left alone: the firmware only
+        changes its layout through ``kb_layout`` (the ``keyboard_layout``
+        tool), so a configuration reload must not desynchronize the layout
+        the controller validates against from the one the firmware types with.
+        """
         self.config = new_config
         self.capture.config = new_config
         self.bootstrap.config = new_config
@@ -195,16 +222,26 @@ class TitellaInstance:
             "titella": self.titella_id,
             "default": is_default,
             "transport": self.config.transport,
+            "agent_protocol": self.config.agent_protocol,
             "serial_port": self.config.serial_port,
             "serial_baud": self.config.serial_baud,
             "wifi_host": self.config.wifi_host,
             "wifi_port": self.config.wifi_port,
+            "window_app": self.config.window_app,
+            "window_title": self.config.window_title,
+            "window_id": self.config.window_id,
             "screen_device": self.config.screen_device,
             "screen_input_format": self.config.screen_input_format,
             "screen_pixel_format": self.config.screen_pixel_format,
             "screen_framerate": self.config.screen_framerate,
             "keyboard_layout": self.config.keyboard_layout,
+            "screen_autocrop": self.config.screen_autocrop,
+            "ocr_endpoint": self.config.ocr_endpoint,
+            "ocr_model": self.config.ocr_model,
+            # The key itself is never reported; only whether one is set.
+            "ocr_api_key_configured": bool(self.config.ocr_api_key),
             "slave_platform": self.config.slave_platform,
+            "slave_transport": self.config.slave_transport,
             "slave_cdc_port": self.config.slave_cdc_port,
             "terminal_mods": list(self.config.terminal_mods) if self.config.terminal_mods else None,
             "terminal_key": self.config.terminal_key,
@@ -220,12 +257,55 @@ class TitellaInstance:
 def _transport_key(config: Config) -> tuple[Any, ...]:
     return (
         config.transport,
+        # The agent channel is part of the link: a window instance builds its
+        # clipboard engine from it at construction, so switching protocols is
+        # a rebuild, not a configuration reload.
+        config.agent_protocol,
+        # The ESP32→slave leg changes which loader runs and which destination
+        # the firmware forwards to, so switching it is a rebuild too.
+        config.slave_transport,
         config.serial_port,
         config.serial_baud,
         config.wifi_host,
         config.wifi_port,
         config.heartbeat_s,
         config.disconnect_grace_s,
+        # Retargeting the window rebuilds the link: a different window is a
+        # different instance, not a configuration reload.
+        config.window_app,
+        config.window_title,
+        config.window_id,
+    )
+
+
+def _candidate_config(
+    globals_map: Mapping[str, Any],
+    table: Mapping[str, Any],
+    titella_id: str,
+    default_titella: str | None,
+    selected_path: Path,
+) -> Config:
+    """Builds the configuration an upsert would produce, without saving it.
+
+    The mixture mirrors ``load_config``: instance keys come from the global
+    block and every table field overrides them. The upsert writes an explicit
+    empty ``slave_cdc_port`` on a HID instance so an inherited global COM is
+    overridden (the parser normalizes the empty value to ``None``) instead of
+    deleting a global other instances still use; an explicit COM together with
+    HID therefore still reaches ``_build_single_config`` and is rejected there.
+    """
+    merged = {k: v for k, v in globals_map.items() if k in _INSTANCE_KEYS}
+    merged.update(table)
+    state_root = Path(str(globals_map.get("state_dir", Path(tempfile.gettempdir()) / "titella"))).expanduser()
+    http_port = _integer(globals_map.get("http_port", 8765), "http_port", 1024, 65535)
+    return _build_single_config(
+        merged,
+        titella_id=titella_id,
+        state_dir=instance_state_dir(state_root, titella_id)
+        if titella_id != DEFAULT_TITELLA_ID else state_root,
+        http_port=http_port,
+        default_titella=default_titella,
+        selected_path=selected_path,
     )
 
 
@@ -368,10 +448,21 @@ class TitellaRegistry:
                 }
                 if inst.config.serial_port:
                     table["serial_port"] = inst.config.serial_port
+                if inst.config.window_app:
+                    table["window_app"] = inst.config.window_app
+                if inst.config.window_title:
+                    table["window_title"] = inst.config.window_title
+                if inst.config.window_id is not None:
+                    table["window_id"] = inst.config.window_id
                 if inst.config.screen_input_format:
                     table["screen_input_format"] = inst.config.screen_input_format
                 if inst.config.slave_platform:
                     table["slave_platform"] = inst.config.slave_platform
+                # Only a non-default channel is materialized: writing the key
+                # for every instance would pin today's default on a config the
+                # operator never set.
+                if inst.config.slave_transport != "cdc":
+                    table["slave_transport"] = inst.config.slave_transport
                 if inst.config.slave_cdc_port:
                     table["slave_cdc_port"] = inst.config.slave_cdc_port
                 if inst.config.terminal_mods is not None:
@@ -380,6 +471,11 @@ class TitellaRegistry:
                     table["terminal_key"] = inst.config.terminal_key
                 if inst.config.launcher_text is not None:
                     table["launcher_text"] = inst.config.launcher_text
+                # Only a non-default protocol is materialized: rewriting a
+                # window entry without the key must not pin today's default.
+                default_protocol = "none" if inst.config.transport == "window" else "serial"
+                if inst.config.agent_protocol != default_protocol:
+                    table["agent_protocol"] = inst.config.agent_protocol
                 titellas_map[tid] = table
             for key in list(globals_map):
                 if key in _INSTANCE_KEYS and key not in {"heartbeat_s", "disconnect_grace_s"}:
@@ -395,16 +491,21 @@ class TitellaRegistry:
         titella: str,
         *,
         transport: str | None = None,
+        agent_protocol: str | None = None,
         serial_port: str | None = None,
         serial_baud: int | None = None,
         wifi_host: str | None = None,
         wifi_port: int | None = None,
+        window_app: str | None = None,
+        window_title: str | None = None,
+        window_id: int | None = None,
         screen_device: str | None = None,
         screen_input_format: str | None = None,
         screen_pixel_format: str | None = None,
         screen_framerate: int | None = None,
         keyboard_layout: str | None = None,
         slave_platform: str | None = None,
+        slave_transport: str | None = None,
         slave_cdc_port: str | None = None,
         terminal_mods: list[str] | str | None = None,
         terminal_key: str | None = None,
@@ -437,16 +538,21 @@ class TitellaRegistry:
             current_table = dict(titellas_map.get(tid, {}))
             updates: dict[str, Any] = {
                 "transport": transport,
+                "agent_protocol": agent_protocol,
                 "serial_port": serial_port,
                 "serial_baud": serial_baud,
                 "wifi_host": wifi_host,
                 "wifi_port": wifi_port,
+                "window_app": window_app,
+                "window_title": window_title,
+                "window_id": window_id,
                 "screen_device": screen_device,
                 "screen_input_format": screen_input_format,
                 "screen_pixel_format": screen_pixel_format,
                 "screen_framerate": screen_framerate,
                 "keyboard_layout": keyboard_layout,
                 "slave_platform": slave_platform,
+                "slave_transport": slave_transport,
                 "slave_cdc_port": slave_cdc_port,
                 "terminal_mods": terminal_mods,
                 "terminal_key": terminal_key,
@@ -455,12 +561,33 @@ class TitellaRegistry:
             for key, value in updates.items():
                 if value is not None:
                     current_table[key] = value
-            titellas_map[tid] = current_table
-
+            if current_table.get("slave_transport") == "hid" and slave_cdc_port is None:
+                # Switching to HID retires the previous COM pin atomically. The
+                # empty value is written on this instance so an inherited global
+                # slave_cdc_port is overridden (the parser normalizes it to
+                # None) without deleting a global other instances still use.
+                current_table["slave_cdc_port"] = ""
             if set_default or default_id is None or len(titellas_map) == 1:
                 default_id = tid
+            titellas_map[tid] = current_table
 
-            # Validate by writing and loading through load_config.
+            # The persisted model is not touched until the complete candidate
+            # has been validated with the same global→instance mixture
+            # load_config applies. A rejected call leaves both the file and the
+            # live instance exactly as they were.
+            candidate = _candidate_config(
+                globals_map, current_table, tid, default_id,
+                self.root_config.config_path,
+            )
+            if existing is not None:
+                transport_changed = _transport_key(existing.config) != _transport_key(candidate)
+                if transport_changed and existing.gate.ready and not force:
+                    raise TransportError(
+                        "titella_busy",
+                        f"titella {tid!r} has a live slave agent; pass force=True or stop the agent before changing its transport/port",
+                        False,
+                    )
+
             save_titella_config(
                 self.root_config.config_path,
                 global_values=globals_map,
@@ -471,13 +598,6 @@ class TitellaRegistry:
             new_cfg = reloaded_root.titellas[tid]
 
             if existing is not None:
-                transport_changed = _transport_key(existing.config) != _transport_key(new_cfg)
-                if transport_changed and existing.gate.ready and not force:
-                    raise TransportError(
-                        "titella_busy",
-                        f"titella {tid!r} has a live slave agent; pass force=True or stop the agent before changing its transport/port",
-                        False,
-                    )
                 if promoted_from_default:
                     self._instances.pop(DEFAULT_TITELLA_ID, None)
                     existing.titella_id = tid

@@ -18,10 +18,12 @@ Three components cooperate:
   one `titella-mcp` stdio wrapper per MCP client.
 - **ESP32-S3**: the firmware router. It executes HID frames locally and
   forwards the other channels between the master port (UART0 or the WPA2
-  SoftAP TCP client) and the native USB CDC toward the slave.
+  SoftAP TCP client) and the selected slave destination: the native USB CDC
+  by default, or the vendor-defined HID data collection once
+  `slave_transport = "hid"` is selected.
 - **Slave**: the controlled machine. The ephemeral agent is deployed by
   `slave_bootstrap` from the immutable `titella-slave-assets` wheel and speaks
-  protocol v1 over the CDC.
+  protocol v1 over the CDC (or the HID data transport).
 
 There are two cables plus one video path: the master→ESP32 link (UART or
 SoftAP TCP), the ESP32→slave native USB link (HID + CDC), and the
@@ -57,6 +59,22 @@ deploys a different payload and launcher profile:
 On Linux the terminal shortcut is configuration, not a default: without
 `terminal_mods` and `terminal_key` the call fails with
 `slave_launcher_required` before any keystroke.
+
+The ESP32→slave leg is a separate selection, `slave_transport`:
+
+| Value | ESP32→slave leg | Requirements |
+|---|---|---|
+| `cdc` (default) | native USB CDC the loader opens | any platform |
+| `hid` | vendor HID data collection, reports `0x10`/`0x11` | `transport="serial"`, `agent_protocol="serial"`, `slave_platform="windows"`, no `slave_cdc_port`, firmware 1.6.0+ |
+
+It is never inferred and never falls back: an old firmware answers
+`slave_transport_unsupported` before any keystroke, and the HID bootstrap
+requires an operator-prepared console (`skip_launch=true`) because it types
+only a short stage-0 line and launches nothing. Switch it with
+`titella_upsert(titella=..., slave_transport="hid")`; switching retires a
+pinned `slave_cdc_port` atomically and is refused while an agent is live
+unless `force=true`. The master's UART to the ESP32 always runs at 2,000,000
+baud, matching the flashed firmware.
 
 The keyboard layout is a second, independent precondition: `layout` is
 mandatory and the configured `keyboard_layout` is never used as a fallback.
@@ -128,7 +146,9 @@ Requirements: rig wired as above, daemon reachable, slave unlocked.
    false, stop here and fix the transport before touching the target.
 2. `screen` — observable result: a PNG plus the capture resolution. A black
    frame means the slave emits no signal (off, suspended, HDMI unplugged),
-   not a capture failure.
+   not a capture failure. With the agent running, `screen(source="agent")`
+   returns the same shape from the agent's own interactive desktop instead of
+   the grabber (see `docs_read("operation")`).
 3. `lock_acquire(owner)` — observable result: the HID lease held by `owner`
    with its expiry. HID and `slave_bootstrap` require it.
 4. `slave_bootstrap(owner, layout="es_ES"|"en_US", platform="...",

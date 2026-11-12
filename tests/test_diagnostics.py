@@ -99,6 +99,35 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(steps), 1)
         self.assertIn("screen()", steps[0])
 
+    def test_hid_failure_never_gives_com_advice(self) -> None:
+        self.config = load_config(environ={
+            "TITELLA_CONFIG": str(Path(self.temp.name) / "absent.toml"),
+            "TITELLA_STATE_DIR": self.temp.name,
+            "TITELLA_SLAVE_PLATFORM": "windows",
+            "TITELLA_SLAVE_TRANSPORT": "hid",
+        })
+        step = next(step for step in self._steps(agent=AGENT_OFF)
+                    if "slave_bootstrap" in step)
+        self.assertIn("slave_transport_unsupported", step)
+        self.assertIn("skip_launch=true", step)
+        # A HID failure is never a COM problem: the advice must not send the
+        # operator to pick a COM port (the trailing sentence only states that
+        # no COM port participates).
+        self.assertNotIn("slave_cdc_port", step)
+        self.assertNotIn("COM5", step)
+        self.assertNotIn("COM[1-9]", step)
+
+    def test_diagnose_reports_the_selected_slave_transport(self) -> None:
+        report = diagnose(
+            self.config,
+            firmware=FIRMWARE_OK,
+            lease=LEASE_HELD,
+            agent=AGENT_READY,
+            resolution=(2560, 1440),
+            capture_age_s=0.5,
+        )
+        self.assertEqual(report["slave_transport"], "cdc")
+
     def test_diagnose_reports_capture_configuration(self) -> None:
         report = diagnose(
             self.config,

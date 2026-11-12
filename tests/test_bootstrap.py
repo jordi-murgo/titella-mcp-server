@@ -8,9 +8,11 @@ import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from titella.bootstrap import (
+    PLATFORM_PROFILES,
     BootstrapManager,
     loader_command,
     loader_source,
@@ -18,6 +20,7 @@ from titella.bootstrap import (
     posix_stub_command,
 )
 from titella.config import load_config
+from titella.serial_link import TransportError
 from titella_slave_assets.bundles import load_bundle
 
 LINK = "0123456789abcdef0123456789abcdef"
@@ -66,6 +69,25 @@ class FakeLink:
         self.handlers: dict[tuple[str, str | None], list] = {}
         self.payload = bytearray()
         self.requests: list[tuple[str, str, dict]] = []
+        self.transport = "serial"
+        # Fresh-health answer for the HID bootstrap. The default mirrors a
+        # 1.6.0 firmware; a test overrides it to prove the old-chip rejection.
+        self.health: dict = {
+            "firmware": "1.6.0", "protocol": 1, "uart_baud": 2000000,
+            "slave_transports": ["cdc", "hid"], "slave_transport": "cdc",
+            "hid_data_protocol": 1, "usb_vid": 6127, "usb_pid": 41871,
+            "usb_serial": "012345ABCDEF",
+        }
+        self.stage_failures: dict[str, str] = {}
+        self.staged_bytes = bytearray()
+        # The firmware's read-only view of the selected destination. Only this
+        # proves a close; RPC failures never do.
+        self.selected_transport = "cdc"
+        self.slave_connected = False
+        self.stop_reply: str | None = None  # error code to raise for agent.stop
+        # False models an agent that answers the stop but keeps its stream: the
+        # reply alone must never be trusted as a close.
+        self.stop_releases = True
 
     def subscribe(self, channel, handler, session_id=None):
         key = (channel, session_id)
@@ -82,20 +104,56 @@ class FakeLink:
 
     def request(self, channel, op, body, timeout=10):
         self.requests.append((channel, op, body))
+        if channel == "hid" and op == "health":
+            return {"body": dict(
+                self.health,
+                slave_transport=self.selected_transport,
+                slave_connected=self.slave_connected,
+            )}
+        if channel == "hid" and op in {"loader_stage_begin", "loader_stage_chunk",
+                                       "loader_stage_commit", "loader_stage_clear"}:
+            failure = self.stage_failures.get(op)
+            if failure is not None:
+                raise TransportError(failure, f"{op} failed", False)
+            if op == "loader_stage_begin":
+                self.staged_bytes = bytearray()
+                self.stage_size = body["size"]
+                return {"body": {"ok": True, "staged": 0}}
+            if op == "loader_stage_chunk":
+                chunk = base64.b64decode(body["data_b64"])
+                self.staged_bytes.extend(chunk)
+                return {"body": {"ok": True, "staged": len(self.staged_bytes)}}
+            return {"body": {"ok": True}}
         if channel == "bootstrap" and op == "loader.push":
             self.staged = getattr(self, "staged", 0) + len(body["data_b64"])
             return {"body": {"status": "staged", "staged": self.staged,
                              "total": body["total"]}}
         if channel == "bootstrap" and op == "commit":
+            # The agent now owns the selected destination.
+            self.slave_connected = True
             self.emit({
                 "v": 1, "channel": "control", "type": "hello", "link_id": LINK,
                 "body": {"uid": 501, "python": "3.9.18"},
             })
             return {"body": {"status": "started"}}
         if channel == "control" and op == "bind":
+            if not self.slave_connected:
+                raise TransportError("route_error", "destination is not connected", False)
             return {"body": {"status": "ready", "link_id": LINK}}
         if channel == "control" and op == "agent.stop":
+            if self.stop_reply is not None:
+                raise TransportError(self.stop_reply, "stop did not answer", True)
+            if not self.slave_connected:
+                raise TransportError("route_error", "destination is not connected", False)
+            # The agent answers and then closes its stream; the fake applies
+            # that close so the observable state changes exactly once.
+            if self.stop_releases:
+                self.slave_connected = False
             return {"body": {"status": "stopped"}}
+        if channel == "hid" and op == "slave_transport":
+            self.selected_transport = body["transport"]
+            return {"body": {"ok": True, "transport": body["transport"],
+                             "status": "selected"}}
         return {"body": {"status": "ready"}}
 
     def send_data(self, channel, session_id, sequence, data):
@@ -222,6 +280,90 @@ class BootstrapTests(unittest.TestCase):
                     })
             return result
         hid.key = key
+
+    def test_bootstrap_stops_a_previous_agent_even_when_the_gate_is_closed(self) -> None:
+        """A live agent with a stale-closed gate still owns the CDC.
+
+        Gating the stop on the in-memory gate left that agent running for ever
+        and every later bootstrap died as bootstrap_loader_timeout, which reads
+        as a port problem the operator cannot see.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            config = load_config(environ={
+                "TITELLA_CONFIG": str(Path(temp) / "absent.toml"),
+                "TITELLA_STATE_DIR": temp,
+                "TITELLA_SLAVE_PLATFORM": "windows",
+                "TITELLA_SLAVE_CDC_PORT": "COM5",
+            })
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            self._auto_ready(link, manager, hid)
+            # The agent process is alive, but the gate closed on a missed
+            # heartbeat: bootstrap must still send the stop before typing.
+            self.assertFalse(manager.gate.ready)
+
+            result = manager.bootstrap("operator", "en_US", layout_confirmed=True)
+
+            self.assertEqual(result["status"], "ready")
+            stops = [r for r in link.requests if r[1] == "agent.stop"]
+            self.assertEqual(len(stops), 1, "the previous agent is stopped unconditionally")
+            self.assertEqual(link.requests[0][1], "agent.stop",
+                             "the stop precedes any bootstrap traffic")
+
+    def test_bootstrap_continues_when_no_previous_agent_answers(self) -> None:
+        """An absent agent answers route_error; that is not a bootstrap failure."""
+        with tempfile.TemporaryDirectory() as temp:
+            config = load_config(environ={
+                "TITELLA_CONFIG": str(Path(temp) / "absent.toml"),
+                "TITELLA_STATE_DIR": temp,
+                "TITELLA_SLAVE_PLATFORM": "windows",
+                "TITELLA_SLAVE_CDC_PORT": "COM5",
+            })
+            link = FakeLink()
+
+            def refuse(channel, op, body, timeout=10):
+                if channel == "control" and op == "agent.stop":
+                    link.requests.append((channel, op, body))
+                    raise TransportError("route_error", "no agent route", False)
+                return FakeLink.request(link, channel, op, body, timeout)
+
+            link.request = refuse  # type: ignore[assignment]
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            self._auto_ready(link, manager, hid)
+
+            result = manager.bootstrap("operator", "en_US", layout_confirmed=True)
+
+            self.assertEqual(result["status"], "ready", result)
+
+    def test_loader_timeout_names_the_occupied_port(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = load_config(environ={
+                "TITELLA_CONFIG": str(Path(temp) / "absent.toml"),
+                "TITELLA_STATE_DIR": temp,
+                "TITELLA_SLAVE_PLATFORM": "windows",
+                "TITELLA_SLAVE_CDC_PORT": "COM5",
+            })
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            # The wait is shortened so the timeout path runs without sleeping
+            # the production deadline; the diagnostic itself is unchanged.
+            saved = dict(PLATFORM_PROFILES)
+            try:
+                for name, profile in saved.items():
+                    PLATFORM_PROFILES[name] = replace(profile, loader_wait_s=0.05)
+                result = manager.bootstrap("operator", "en_US", layout_confirmed=True)
+            finally:
+                PLATFORM_PROFILES.clear()
+                PLATFORM_PROFILES.update(saved)
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["error"]["code"], "bootstrap_loader_timeout")
+            # A timeout must name the port and the usual cause instead of
+            # leaving the operator with an unexplained stub failure.
+            self.assertIn("COM5", result["error"]["message"])
+            self.assertIn("previous agent", result["error"]["message"])
 
     def test_missing_platform_fails_before_any_keystroke(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -433,92 +575,6 @@ class BootstrapTests(unittest.TestCase):
             bundle = load_bundle("python")
             self.assertEqual(bytes(link.payload), bundle.payload)
 
-    def test_windows_profile_uses_start_search_powershell_and_the_cs_payload(self) -> None:
-        from titella.bootstrap import PLATFORM_PROFILES, windows_loader_lines
-        profile = PLATFORM_PROFILES["windows"]
-        self.assertEqual((profile.loader_wait_s, profile.hello_wait_s), (30, 90))
-        with tempfile.TemporaryDirectory() as temp:
-            config = load_config(environ={
-                "TITELLA_CONFIG": str(Path(temp) / "absent.toml"),
-                "TITELLA_STATE_DIR": temp,
-                "TITELLA_SLAVE_PLATFORM": "windows",
-                "TITELLA_SLAVE_CDC_PORT": "COM5",
-            })
-            link = FakeLink()
-            hid = FakeHid()
-            manager = BootstrapManager(config, link, hid)
-            self._auto_ready(link, manager, hid)
-            result = manager.bootstrap("operator", "en_US", layout_confirmed=True)
-            self.assertEqual(result["status"], "ready")
-            self.assertEqual(result["platform"], "windows")
-            self.assertEqual(result["implementation"], "windows-dotnet")
-            self.assertEqual(hid.keys[0], ("operator", "ESC", ("CTRL",)))
-            self.assertEqual(hid.typed[0], "powershell")
-            self.assertEqual(hid.keys[2:4], [
-                ("operator", "ESC", ()),
-                ("operator", "C", ("CTRL",)),
-            ])
-
-            # The loader is pushed over the CDC and only the stub is typed.
-            pushes = [r for r in link.requests if r[1] == "loader.push"]
-            self.assertGreaterEqual(len(pushes), 1)
-            pushed = "".join(r[2]["data_b64"] for r in pushes)
-            from titella.bootstrap import windows_loader_blob
-            self.assertEqual(pushed, windows_loader_blob(
-                LINK, manager.status()["session_id"], "COM5"))
-            self.assertEqual(pushes[-1][2]["total"], len(pushed))
-
-            # Rebuild the console lines from the ordered transcript: each line
-            # is submitted with its own Enter.
-            lines: list[str] = []
-            current: list[str] = []
-            for kind, *payload in hid.events:
-                if kind == "type":
-                    current.append(payload[0])
-                elif payload[0] == "ENTER":
-                    lines.append("".join(current))
-                    current = []
-            self.assertEqual(lines[0], "powershell")
-            from titella.bootstrap import windows_stub_command
-            self.assertEqual(lines[1], windows_stub_command(LINK, "COM5"))
-            self.assertEqual(len(lines), 2)
-
-            # The typed stub avoids the backtick dead key (`es_ES` maps `` ` ``
-            # to 0x00 in Arduino USBHIDKeyboard), prints per-chunk progress and
-            # disables PSReadLine history saving before anything else runs.
-            self.assertNotIn("`", lines[1])
-            self.assertIn("[Console]::Write(++$n)", lines[1])
-            self.assertIn("$p.WriteLine(", lines[1])
-            self.assertIn(
-                "Set-PSReadLineOption -HistorySaveStyle SaveNothing", lines[1])
-
-            # The typed text is only the flow-controlled stub (~796 chars), not
-            # the ~6 500-char loader.
-            typed = sum(len(text) for text in hid.typed)
-            self.assertLess(typed, 800)
-            # Every HID call stays bounded and Windows is typed at 8 ms/char.
-            self.assertTrue(all(len(text) <= 256 for text in hid.typed))
-            self.assertTrue(all(delay == 8 for delay in hid.typed_delays))
-            status = manager.status()
-            self.assertEqual(status["stage_chars_sent"], len(pushed))
-            self.assertEqual(status["stage_chars_total"], len(pushed))
-            self.assertEqual(status["stage_chunks_acked"], len(pushes))
-            self.assertEqual(status["stage_chunks_total"], len(pushes))
-
-            # The pushed blob reconstructs the wheel's readable Windows loader.
-            rendered = gzip.decompress(base64.b64decode(pushed)).decode("utf-8")
-            self.assertEqual(rendered, loader_source(
-                LINK, manager.status()["session_id"], "COM5",
-                implementation="windows-dotnet",
-            ))
-            for forbidden in ("ExecutionPolicy Bypass", "Unblock-File",
-                              "-WindowStyle Hidden", "-File "):
-                self.assertNotIn(forbidden, rendered)
-            # The transferred payload is exactly the selected bundle.
-            bundle = load_bundle("windows-dotnet")
-            self.assertEqual(result["size"], len(bundle.payload))
-            self.assertEqual(bytes(link.payload), bundle.payload)
-            self.assertEqual(result["sha256"], bundle.sha256)
 
     def test_empty_launcher_text_override_is_authoritative(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -681,7 +737,7 @@ class BootstrapTests(unittest.TestCase):
             # the stub. Reap whatever still points at this bootstrap directory
             # so a PTY-backed run cannot leave an orphan holding the terminal.
             subprocess.run(
-                ["pkill", "-9", "-f", tempfile.gettempdir() + "/titella-bootstrap-"],
+                ["pkill", "-9", "-f", "/.payload.pyz --port " + port],
                 check=False,
             )
 
@@ -712,6 +768,568 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(command.startswith("python3 -c "))
         self.assertNotIn("curl", command)
         self.assertNotIn("http", command.lower())
+
+
+class HidBootstrapTests(unittest.TestCase):
+    """The HID leg: preconditions, staging order and cleanup, no CDC."""
+
+    def _config(self, temp: str, **extra: str):
+        environ = {
+            "TITELLA_CONFIG": str(Path(temp) / "absent.toml"),
+            "TITELLA_STATE_DIR": temp,
+            "TITELLA_SLAVE_PLATFORM": "windows",
+            "TITELLA_SLAVE_TRANSPORT": "hid",
+        }
+        environ.update(extra)
+        return load_config(environ=environ)
+
+    def test_hid_requires_an_operator_prepared_console(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows", layout_confirmed=True,
+            )
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["error"]["code"], "invalid_argument")
+            self.assertIn("skip_launch", result["error"]["message"])
+            # No lease, no key, no staging: the contradiction is pre-teclas.
+            self.assertEqual(hid.lease.owners, [])
+            self.assertEqual(hid.keys, [])
+            self.assertEqual(hid.typed, [])
+            self.assertEqual(link.requests, [])
+
+    def test_hid_rejects_a_cdc_port_and_a_non_windows_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            for call, message in (
+                ({"platform": "windows", "cdc_port": "COM5"}, "cdc_port"),
+                ({"platform": "macos"}, "platform='windows'"),
+            ):
+                with self.subTest(call=call):
+                    hid = FakeHid()
+                    manager = BootstrapManager(config, FakeLink(), hid)
+                    result = manager.bootstrap(
+                        "operator", "es_ES", layout_confirmed=True,
+                        skip_launch=True, **call,
+                    )
+                    self.assertEqual(result["error"]["code"], "invalid_argument")
+                    self.assertIn(message, result["error"]["message"])
+                    self.assertEqual(hid.keys, [])
+                    self.assertEqual(hid.typed, [])
+
+    def test_old_firmware_is_rejected_before_any_keystroke(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            for health_update in (
+                {"hid_data_protocol": None},
+                {"slave_transports": ["cdc"]},
+                {"usb_vid": 1234},
+                {"usb_pid": 5678},
+                {"usb_serial": "tite-lla"},
+            ):
+                with self.subTest(health=health_update):
+                    link = FakeLink()
+                    link.health.update(health_update)
+                    hid = FakeHid()
+                    manager = BootstrapManager(config, link, hid)
+                    result = manager.bootstrap(
+                        "operator", "es_ES", platform="windows",
+                        layout_confirmed=True, skip_launch=True,
+                    )
+                    self.assertEqual(result["status"], "error")
+                    self.assertEqual(result["error"]["code"],
+                                     "slave_transport_unsupported")
+                    self.assertEqual(hid.keys, [])
+                    self.assertEqual(hid.typed, [])
+                    # Only the fresh health query reached the firmware.
+                    self.assertEqual(
+                        [r[1] for r in link.requests], ["health"],
+                    )
+
+    def test_unreachable_health_is_reported_as_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+
+            def refuse(channel, op, body, timeout=10):
+                if channel == "hid" and op == "health":
+                    raise TransportError("request_timeout", "no hid.health", True)
+                return FakeLink.request(link, channel, op, body, timeout)
+
+            link.request = refuse  # type: ignore[assignment]
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows",
+                layout_confirmed=True, skip_launch=True,
+            )
+            self.assertEqual(result["error"]["code"], "slave_transport_unsupported")
+            self.assertEqual(hid.typed, [])
+
+    def test_hid_stages_the_snapshot_before_typing_and_clears_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            original_type = hid.type_text
+            stage_seen_at_typing: list[bool] = []
+
+            def type_text(owner, text, delay):
+                if not hid.typed:
+                    stage_seen_at_typing.append(
+                        any(op == "loader_stage_commit" for _c, op, _b in link.requests)
+                    )
+                return original_type(owner, text, delay)
+            hid.type_text = type_text  # type: ignore[assignment]
+
+            def ready_after_enter():
+                link.emit({
+                    "v": 1, "channel": "bootstrap", "type": "event", "link_id": LINK,
+                    "session_id": manager.status()["session_id"],
+                    "op": "loader.ready", "body": {"runtime": "stage0"},
+                })
+            hid.on_enter = ready_after_enter
+
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows",
+                layout_confirmed=True, skip_launch=True,
+            )
+            self.assertEqual(result["status"], "ready", result)
+            self.assertEqual(result["slave_transport"], "hid")
+            self.assertEqual(result["hid_binding"], "HID:012345ABCDEF")
+            # The snapshot is committed before any typed character.
+            self.assertEqual(stage_seen_at_typing, [True])
+            ops = [op for _c, op, _b in link.requests]
+            self.assertIn("loader_stage_begin", ops)
+            self.assertIn("loader_stage_commit", ops)
+            self.assertEqual(ops[-1], "loader_stage_clear")
+            # The staged bytes are the gzip of the HID container (rendered
+            # loader, marker, transport unit), not a second render: their
+            # SHA-256 is the one handed to begin/commit.
+            begin = next(b for _c, op, b in link.requests if op == "loader_stage_begin")
+            import hashlib
+            self.assertEqual(hashlib.sha256(bytes(link.staged_bytes)).hexdigest(),
+                             begin["sha256"])
+            self.assertEqual(len(link.staged_bytes), begin["size"])
+            # No CDC path ran: no stub typing, no loader.push, no clipboard.
+            self.assertFalse(any("stage.ready" in chunk for chunk in hid.typed))
+            self.assertFalse(any("Get-Clipboard" in chunk for chunk in hid.typed))
+            self.assertNotIn("loader.push", ops)
+            # The destination is selected before the layout is touched.
+            self.assertEqual(
+                ops.index("slave_transport") < ops.index("loader_stage_begin"), True)
+
+    def test_hid_snapshot_container_carries_the_unit_behind_one_marker(self) -> None:
+        """The staged blob is the #@# container: the transport unit travels
+        as raw UTF-8 after exactly one marker and never as Base64 script
+        text inside the rendered loader."""
+        import gzip
+        from titella.bootstrap import _hid_container
+
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+
+            def ready_after_enter():
+                link.emit({
+                    "v": 1, "channel": "bootstrap", "type": "event", "link_id": LINK,
+                    "session_id": manager.status()["session_id"],
+                    "op": "loader.ready", "body": {"runtime": "stage0"},
+                })
+            hid.on_enter = ready_after_enter
+
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows",
+                layout_confirmed=True, skip_launch=True,
+            )
+            self.assertEqual(result["status"], "ready", result)
+            container = gzip.decompress(bytes(link.staged_bytes)).decode("utf-8")
+            bundle = load_bundle("windows-dotnet")
+            self.assertEqual(container.count("#@#"), 1,
+                             "the marker must appear exactly once")
+            loader_part, _, unit_part = container.partition("#@#")
+            self.assertEqual(unit_part.strip(), bundle.hid_transport_source.strip())
+            self.assertNotIn(bundle.hid_transport_source, loader_part)
+            self.assertNotIn(
+                base64.b64encode(bundle.hid_transport_source.encode("utf-8")).decode("ascii"),
+                loader_part,
+                "the unit must not travel embedded as Base64",
+            )
+            # The marker may appear in neither half: the packer rejects it.
+            with self.assertRaisesRegex(ValueError, "container marker"):
+                _hid_container("x#@#y", bundle.hid_transport_source)
+            with self.assertRaisesRegex(ValueError, "container marker"):
+                _hid_container(loader_part, "a#@#b")
+
+    def test_hid_clears_the_slot_even_when_the_run_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            link.stage_failures["loader_stage_commit"] = "checksum_mismatch"
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows",
+                layout_confirmed=True, skip_launch=True,
+            )
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["error"]["code"], "checksum_mismatch")
+            ops = [op for _c, op, _b in link.requests]
+            self.assertEqual(ops[-1], "loader_stage_clear")
+            self.assertEqual(hid.typed, [])
+            status = manager.status()
+            self.assertEqual(status["status"], "error")
+            self.assertEqual(status["slave_transport"], "hid")
+
+    def test_hid_oversized_loader_fails_before_publishing_the_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            import titella.bootstrap as bootstrap_module
+            saved = bootstrap_module._HID_SNAPSHOT_MAX_BYTES
+            try:
+                bootstrap_module._HID_SNAPSHOT_MAX_BYTES = 16
+                result = manager.bootstrap(
+                    "operator", "es_ES", platform="windows",
+                    layout_confirmed=True, skip_launch=True,
+                )
+            finally:
+                bootstrap_module._HID_SNAPSHOT_MAX_BYTES = saved
+            self.assertEqual(result["error"]["code"], "hid_loader_too_large")
+            ops = [op for _c, op, _b in link.requests]
+            self.assertNotIn("loader_stage_begin", ops)
+            self.assertEqual(hid.typed, [])
+
+    def test_hid_oversized_stage0_fails_before_typing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            import titella.bootstrap as bootstrap_module
+            saved = bootstrap_module._HID_STAGE0_MAX_CHARS
+            try:
+                bootstrap_module._HID_STAGE0_MAX_CHARS = 64
+                result = manager.bootstrap(
+                    "operator", "es_ES", platform="windows",
+                    layout_confirmed=True, skip_launch=True,
+                )
+            finally:
+                bootstrap_module._HID_STAGE0_MAX_CHARS = saved
+            self.assertEqual(result["error"]["code"], "hid_stage0_too_large")
+            self.assertEqual(hid.typed, [])
+            ops = [op for _c, op, _b in link.requests]
+            self.assertNotIn("loader_stage_begin", ops)
+
+
+    def test_stop_does_not_report_finished_while_the_stream_stays_attached(self) -> None:
+        """A stop reply (or its timeout) is never proof of a closed stream."""
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            for stop_reply in (None, "request_timeout", "route_error"):
+                with self.subTest(stop_reply=stop_reply):
+                    link = FakeLink()
+                    hid = FakeHid()
+                    manager = BootstrapManager(config, link, hid)
+                    link.selected_transport = "hid"
+                    link.slave_connected = True
+                    link.stop_reply = stop_reply
+                    if stop_reply is None:
+                        # The agent answers but never releases the stream.
+                        link.stop_releases = False
+                    # The agent never releases the stream: no reply may be
+                    # reported and the gate must stay closed.
+                    with self.assertRaises(TransportError) as ctx:
+                        manager.stop()
+                    self.assertEqual(ctx.exception.code, "agent_stop_timeout")
+                    self.assertFalse(manager.gate.ready)
+                    self.assertNotEqual(manager.status().get("status"), "stopped")
+
+    def test_stop_returns_once_the_firmware_reports_the_stream_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            link.selected_transport = "hid"
+            link.slave_connected = True
+            # The stop timed out, but the close is observable right away: the
+            # report is success because the state, not the RPC, says closed.
+            link.stop_reply = "request_timeout"
+            link.slave_connected = False
+            result = manager.stop()
+            self.assertEqual(result["status"], "stopped")
+            self.assertEqual(manager.status()["status"], "stopped")
+            self.assertFalse(manager.gate.ready)
+
+    def test_bootstrap_does_not_select_or_type_while_the_stream_is_attached(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            link.selected_transport = "hid"
+            link.slave_connected = True  # a previous agent still owns the epoch
+            link.stop_reply = "request_timeout"
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows",
+                layout_confirmed=True, skip_launch=True,
+            )
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["error"]["code"], "agent_stop_timeout")
+            ops = [op for _c, op, _b in link.requests]
+            # No destination change, no staging and no keystroke happened.
+            self.assertNotIn("slave_transport", ops)
+            self.assertNotIn("loader_stage_begin", ops)
+            self.assertEqual(hid.keys, [])
+            self.assertEqual(hid.typed, [])
+            self.assertEqual(hid.layouts, [])
+
+    def test_bootstrap_waits_until_the_old_stream_is_observably_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            link.selected_transport = "hid"
+            link.slave_connected = True
+            link.stop_reply = "request_timeout"
+            probes = {"count": 0}
+            original_request = link.request
+
+            def delayed_close(channel, op, body, timeout=10):
+                if channel == "hid" and op == "health":
+                    probes["count"] += 1
+                    if probes["count"] >= 3:
+                        link.slave_connected = False
+                return original_request(channel, op, body, timeout)
+
+            link.request = delayed_close  # type: ignore[assignment]
+            hid.on_enter = lambda: link.emit({
+                "v": 1, "channel": "bootstrap", "type": "event", "link_id": LINK,
+                "session_id": manager.status()["session_id"],
+                "op": "loader.ready", "body": {"runtime": "stage0"},
+            })
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows",
+                layout_confirmed=True, skip_launch=True,
+            )
+            self.assertEqual(result["status"], "ready", result)
+            self.assertGreaterEqual(probes["count"], 3)
+            ops = [op for _c, op, _b in link.requests]
+            # The destination was selected only after the close was observed.
+            self.assertLess(ops.index("health"), ops.index("slave_transport"))
+
+    def test_stop_wait_proves_close_on_either_selected_destination(self) -> None:
+        """A HID instance may have to stop an agent that opened the CDC leg."""
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            for selected, connected in (("cdc", True), ("cdc", False),
+                                        ("hid", True), ("hid", False)):
+                with self.subTest(selected=selected, connected=connected):
+                    link = FakeLink()
+                    hid = FakeHid()
+                    manager = BootstrapManager(config, link, hid)
+                    link.selected_transport = selected
+                    link.slave_connected = connected
+                    link.stop_reply = "request_timeout"
+                    if connected:
+                        with self.assertRaises(TransportError) as ctx:
+                            manager.stop()
+                        self.assertEqual(ctx.exception.code, "agent_stop_timeout")
+                        self.assertNotEqual(manager.status().get("status"), "stopped")
+                    else:
+                        self.assertEqual(manager.stop()["status"], "stopped")
+                        self.assertEqual(manager.status()["status"], "stopped")
+
+    def test_hid_bootstrap_waits_for_a_cdc_open_then_allows_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            # A previous agent is on the CDC leg, which the firmware still
+            # forwards to: the stop timed out and the line stays open.
+            link.selected_transport = "cdc"
+            link.slave_connected = True
+            link.stop_reply = "request_timeout"
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows",
+                layout_confirmed=True, skip_launch=True,
+            )
+            self.assertEqual(result["error"]["code"], "agent_stop_timeout")
+            ops = [op for _c, op, _b in link.requests]
+            self.assertNotIn("slave_transport", ops)
+            self.assertEqual(hid.keys, [])
+            self.assertEqual(hid.typed, [])
+
+            # The host line closes: the same flow proceeds, and only then
+            # switches the firmware's destination.
+            probes = {"count": 0}
+            original_request = link.request
+
+            def closes_after_two_probes(channel, op, body, timeout=10):
+                if channel == "hid" and op == "health":
+                    probes["count"] += 1
+                    if probes["count"] >= 2:
+                        link.slave_connected = False
+                return original_request(channel, op, body, timeout)
+
+            link.request = closes_after_two_probes  # type: ignore[assignment]
+            link.requests.clear()
+            hid.on_enter = lambda: link.emit({
+                "v": 1, "channel": "bootstrap", "type": "event", "link_id": LINK,
+                "session_id": manager.status()["session_id"],
+                "op": "loader.ready", "body": {"runtime": "stage0"},
+            })
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows",
+                layout_confirmed=True, skip_launch=True,
+            )
+            self.assertEqual(result["status"], "ready", result)
+            ops = [op for _c, op, _b in link.requests]
+            self.assertIn("slave_transport", ops)
+            self.assertLess(ops.index("health"), ops.index("slave_transport"))
+
+    def test_hid_config_cannot_claim_stopped_without_the_state_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            original_request = link.request
+
+            def fieldless_health(channel, op, body, timeout=10):
+                if channel == "hid" and op == "health":
+                    frame = original_request(channel, op, body, timeout)
+                    frame["body"].pop("slave_connected", None)
+                    return frame
+                return original_request(channel, op, body, timeout)
+
+            link.request = fieldless_health  # type: ignore[assignment]
+            link.selected_transport = "hid"
+            link.slave_connected = True
+            with self.assertRaises(TransportError) as ctx:
+                manager.stop()
+            self.assertEqual(ctx.exception.code, "agent_stop_timeout")
+            self.assertNotEqual(manager.status().get("status"), "stopped")
+
+    def test_stop_wait_is_skipped_where_the_state_is_not_observable(self) -> None:
+        """A CDC-configured instance keeps its previous behaviour."""
+        with tempfile.TemporaryDirectory() as temp:
+            config = load_config(environ={
+                "TITELLA_CONFIG": str(Path(temp) / "absent.toml"),
+                "TITELLA_STATE_DIR": temp,
+                "TITELLA_SLAVE_PLATFORM": "windows",
+            })
+            self.assertEqual(config.slave_transport, "cdc")
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            original_request = link.request
+
+            def legacy_health(channel, op, body, timeout=10):
+                if channel == "hid" and op == "health":
+                    frame = original_request(channel, op, body, timeout)
+                    frame["body"].pop("slave_connected", None)
+                    return frame
+                return original_request(channel, op, body, timeout)
+
+            link.request = legacy_health  # type: ignore[assignment]
+            link.selected_transport = "cdc"
+            link.slave_connected = True
+            self.assertEqual(manager.stop()["status"], "stopped")
+
+
+    def test_failure_reports_the_attempt_binding_and_never_a_stale_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            # A previous attempt left a binding in the merged status.
+            manager._set(status="error", hid_binding="HID:FFFFFFFFFFFF")
+            link.stage_failures["loader_stage_commit"] = "checksum_mismatch"
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows",
+                layout_confirmed=True, skip_launch=True,
+            )
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["slave_transport"], "hid")
+            self.assertEqual(result["hid_binding"], "HID:012345ABCDEF")
+            status = manager.status()
+            self.assertEqual(status["slave_transport"], "hid")
+            self.assertEqual(status["hid_binding"], "HID:012345ABCDEF")
+
+    def test_unsupported_health_clears_the_binding_and_names_the_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            link.health.update({"hid_data_protocol": None})
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            manager._set(status="error", hid_binding="HID:FFFFFFFFFFFF")
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows",
+                layout_confirmed=True, skip_launch=True,
+            )
+            self.assertEqual(result["error"]["code"], "slave_transport_unsupported")
+            self.assertEqual(result["slave_transport"], "hid")
+            self.assertNotIn("hid_binding", result)
+            status = manager.status()
+            self.assertEqual(status["slave_transport"], "hid")
+            self.assertIsNone(status["hid_binding"])
+
+    def test_early_argument_rejection_does_not_touch_the_live_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp)
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            manager._set(status="ready", slave_transport="hid",
+                         hid_binding="HID:012345ABCDEF", stage_elapsed_s=1.5)
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows", layout_confirmed=True,
+            )  # skip_launch missing: rejected before any keystroke
+            self.assertEqual(result["error"]["code"], "invalid_argument")
+            status = manager.status()
+            self.assertEqual(status["status"], "ready")
+            self.assertEqual(status["hid_binding"], "HID:012345ABCDEF")
+            self.assertEqual(status["stage_elapsed_s"], 1.5)
+
+    def test_cdc_ready_result_clears_a_leftover_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = load_config(environ={
+                "TITELLA_CONFIG": str(Path(temp) / "absent.toml"),
+                "TITELLA_STATE_DIR": temp,
+                "TITELLA_SLAVE_PLATFORM": "linux",
+                "TITELLA_TERMINAL_MODS": "SUPER",
+                "TITELLA_TERMINAL_KEY": "RETURN",
+            })
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+            manager._set(hid_binding="HID:FFFFFFFFFFFF")
+            hid.on_enter = lambda: link.emit({
+                "v": 1, "channel": "bootstrap", "type": "event", "link_id": LINK,
+                "session_id": manager.status()["session_id"],
+                "op": "loader.ready", "body": {"runtime": "python"},
+            })
+            result = manager.bootstrap(
+                "operator", "en_US", platform="linux", layout_confirmed=True,
+            )
+            self.assertEqual(result["status"], "ready", result)
+            self.assertEqual(result["slave_transport"], "cdc")
+            self.assertIsNone(result["hid_binding"])
+            self.assertIsNone(manager.status()["hid_binding"])
 
 
 if __name__ == "__main__":

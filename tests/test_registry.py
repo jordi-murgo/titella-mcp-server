@@ -140,6 +140,84 @@ class RegistryTests(unittest.TestCase):
                 reg.remove("omarchy", force=True)
             self.assertEqual(last_ctx.exception.code, "invalid_argument")
 
+    def test_upsert_to_hid_is_atomic_and_overrides_an_inherited_com(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cfg_path = root / "config.toml"
+            cfg_path.write_text(
+                f'state_dir = "{root / "state"}"\n'
+                'serial_baud = 2000000\n'
+                'slave_platform = "windows"\n'
+                'slave_cdc_port = "COM5"\n\n'
+                '[titella.other]\n'
+                'serial_port = "/dev/cu.other"\n\n'
+                '[titella.winlab]\n'
+                'serial_port = "/dev/cu.wch1"\n',
+                encoding="utf-8",
+            )
+            config = load_config(cfg_path, {})
+            self.assertEqual(config.titellas["winlab"].slave_cdc_port, "COM5")
+            reg = TitellaRegistry(config, instance_factory=_fake_instance)
+            # The fake link binds immediately, so an agent reads as live; the
+            # switch below is the legitimate stop-then-switch order.
+            reg.resolve("winlab").gate.set_ready(False)
+
+            updated = reg.upsert("winlab", slave_transport="hid")
+            winlab = reg.resolve("winlab").config
+            self.assertEqual(updated["status"], "updated")
+            self.assertEqual(winlab.slave_transport, "hid")
+            # The inherited global COM is overridden on this instance only.
+            self.assertIsNone(winlab.slave_cdc_port)
+            self.assertEqual(reg.resolve("other").config.slave_cdc_port, "COM5")
+            text = cfg_path.read_text(encoding="utf-8")
+            self.assertIn('slave_cdc_port = "COM5"', text, "the global pin must survive")
+            self.assertIn('slave_transport = "hid"', text)
+            # A second upsert of the same selection is a no-op on the file.
+            reg.upsert("winlab", slave_transport="hid")
+            self.assertEqual(cfg_path.read_text(encoding="utf-8"), text)
+
+    def test_upsert_rejects_a_hid_com_contradiction_without_touching_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cfg_path = root / "config.toml"
+            cfg_path.write_text(
+                f'state_dir = "{root / "state"}"\n'
+                'slave_platform = "windows"\n\n'
+                '[titella.winlab]\n'
+                'serial_port = "/dev/cu.wch1"\n',
+                encoding="utf-8",
+            )
+            config = load_config(cfg_path, {})
+            reg = TitellaRegistry(config, instance_factory=_fake_instance)
+            before = cfg_path.read_text(encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "slave_cdc_port"):
+                reg.upsert("winlab", slave_transport="hid", slave_cdc_port="COM5")
+            self.assertEqual(cfg_path.read_text(encoding="utf-8"), before)
+            self.assertEqual(reg.resolve("winlab").config.slave_transport, "cdc")
+
+    def test_upsert_refuses_a_hid_switch_while_the_agent_is_live(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cfg_path = root / "config.toml"
+            cfg_path.write_text(
+                f'state_dir = "{root / "state"}"\n'
+                'slave_platform = "windows"\n\n'
+                '[titella.winlab]\n'
+                'serial_port = "/dev/cu.wch1"\n',
+                encoding="utf-8",
+            )
+            config = load_config(cfg_path, {})
+            reg = TitellaRegistry(config, instance_factory=_fake_instance)
+            reg.resolve("winlab").gate.set_ready(True)
+            before = cfg_path.read_text(encoding="utf-8")
+            with self.assertRaises(TransportError) as ctx:
+                reg.upsert("winlab", slave_transport="hid")
+            self.assertEqual(ctx.exception.code, "titella_busy")
+            # A rejected call changes neither the file nor the live instance.
+            self.assertEqual(cfg_path.read_text(encoding="utf-8"), before)
+            self.assertEqual(reg.resolve("winlab").config.slave_transport, "cdc")
+            self.assertTrue(reg.resolve("winlab").gate.ready)
+
     def test_agent_route_failure_closes_stale_gate_and_rebinds(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             config = load_config(

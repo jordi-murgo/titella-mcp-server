@@ -117,12 +117,16 @@ before any keystroke.
 ## Windows: COM port, policies and compile
 
 - **Port selection.** With no explicit `slave_cdc_port`, the loader inspects
-  the PnP `Ports` class and each port's ancestor chain, and accepts only a
-  port whose product is `Titella KVM` or whose serial starts with `TITELLA-`.
-  One candidate is used; zero yields `cdc_not_found`; several yield
-  `cdc_ambiguous`. Both are fixed by passing `slave_cdc_port` explicitly
-  (`COM[1-9][0-9]*`, for example `COM5`). The agent reuses that port when
-  the link reconnects.
+  the present PnP `Ports` class and accepts only a port whose instance id
+  carries the project vendor/product pair `VID_17EF&PID_A38F`. One candidate
+  is used; zero yields `cdc_not_found`; several yield `cdc_ambiguous`. Both
+  are fixed by passing `slave_cdc_port` explicitly (`COM[1-9][0-9]*`, for
+  example `COM5`). The agent reuses that port when the link reconnects, and
+  the CDC runs at 2,000,000 8N1 like the UART.
+- **Receiver failure during `loader.push`.** `OperatorRequiresNumber` is a
+  bootstrap-stub defect, not a permission problem. Port discovery must not
+  share state with receive progress; the receiver emits one marker per block.
+  On failure it closes its own port before returning to the console.
 - **No PnP identity.** If the Windows build does not expose the device
   identity through PnP, the loader refuses to guess and returns
   `cdc_not_found` with the explicit-override instruction. Pass
@@ -159,6 +163,35 @@ before any keystroke.
   a different COM number. Re-run `slave_bootstrap` with the current port; do
   not keep a stale `slave_cdc_port` for a device that no longer exists.
 
+## HID slave transport (`slave_transport = "hid"`)
+
+- **An old firmware.** The HID leg needs `hid_data_protocol: 1` and `"hid"` in
+  `slave_transports` from a fresh `hid.health`. A chip flashed before 1.6.0
+  answers `slave_transport_unsupported` before any keystroke; reflash it. The
+  bootstrap never falls back to the CDC.
+- **No COM port participates.** A HID failure is never a COM problem: do not
+  pass `slave_cdc_port` (the bootstrap rejects it) and do not chase COM advice
+  for `bootstrap_loader_timeout`. Verify the operator-prepared console
+  received the typed stage-0 line, its active layout matches, and PowerShell
+  5.1 with `FullLanguage` is allowed.
+- **Fixed budgets.** The compressed loader container must fit 32768 bytes
+  and the typed stage-0 line 3328 characters (~26.6 s of pacing); exceeding
+  either fails as `hid_loader_too_large`/`hid_stage0_too_large` before the
+  snapshot is published. Shrink the loader instead of extending a timeout.
+- **Busy collection.** One HID consumer at a time: an earlier loader or agent
+  that still holds `Local\Titella.Hid.<serial>` answers `hid_busy`. Stop the
+  previous agent first (`slave_stop`, or the bootstrap's own stop) before
+  bootstrapping again.
+- **Proven close, not a reply.** A HID stop returns `stopped` only after
+  `hid.health` reports `slave_connected: false` for the destination the
+  firmware forwards to (both `cdc` and `hid` are meaningful: the CDC line
+  state follows the host's `DTR && RTS`); a stop reply, its timeout or a
+  `route_error` never prove a closed stream. When the state is unobservable or
+  still connected within the wait the call answers `agent_stop_timeout` and
+  the gate stays closed, and a bootstrap refuses to change the destination or
+  type while the old stream is attached. A CDC- or window-configured instance
+  keeps its previous behaviour.
+
 ## Capture problems
 
 `screen` failures are local to the master: `screen_capture_failed` is
@@ -168,6 +201,18 @@ not a failure: it means the slave is off, suspended, or the HDMI cable is
 unplugged. The capture device is fixed hardware ("USB3 Video" by default);
 captures are occasional and on demand.
 
+`screen(source="agent")` does not touch the grabber: it asks a running agent
+for one PNG of its primary monitor. `agent_not_ready` means the gate is closed
+(run `slave_bootstrap`), `screen_unsupported` means the deployed agent has no
+`fs.screen` or its platform has no capture path (the message names the missing
+tool), `screen_permission_denied` means the session refused it (macOS Screen
+Recording or a Wayland portal), `invalid_screen_capture` means
+the received bytes contradict the metadata, and `screen_too_large` means the
+image exceeded the 32 MiB bound. A `stream_timeout` before the finished event
+is an interrupted transfer, not a lock: locked sessions, secure desktops,
+protected surfaces and disconnected RDP sessions are simply not guaranteed
+capturable, and a black agent frame is not proof of any of them.
+
 ## Transport and daemon problems
 
 - If the wrapper reports a foreign service or a stale version on the port,
@@ -176,8 +221,9 @@ captures are occasional and on demand.
   send SIGTERM to that PID before the next wrapper starts the new build.
 - If the firmware is unreachable, check `TITELLA_TRANSPORT` (`serial` or
   `wifi`), the port, and the baud rate: master and firmware must use the same
-  rate. `hid.health` reports the flashed `firmware`, `protocol` and
-  `uart_baud`, so a stale firmware is distinguishable from a working one.
+  rate (2,000,000 by default). `hid.health` reports the flashed `firmware`,
+  `protocol`, `uart_baud` and the HID transport fields, so a stale firmware is
+  distinguishable from a working one.
 - A non-HID `route_error` invalidates the agent's ready state. The next control
   heartbeat attempts to bind the live agent again; until that succeeds, agent
   tools return `agent_not_ready` instead of operating against stale state.

@@ -89,8 +89,8 @@ _CATALOG: tuple[_Document, ...] = (
         title="Bootstrap the Windows slave agent",
         description=(
             "Windows 10 1809+/11 with PowerShell 5.1 and .NET Framework 4.7.2+: "
-            "COM resolution, C# payload, ConPTY, job containment, timeouts and "
-            "policy refusals."
+            "COM resolution, the USB-only HID stage-0 bootstrap, C# payload, "
+            "ConPTY, job containment, timeouts and policy refusals."
         ),
         source=SOURCE_SLAVE_ASSETS,
         package="titella_slave_assets",
@@ -139,7 +139,8 @@ _CATALOG: tuple[_Document, ...] = (
         title="Serial protocol v1",
         description=(
             "Canonical v1 contract: framing and limits, envelope, allowed "
-            "directions, ACK and windows, heartbeat, bind and lifecycle."
+            "directions, ACK and windows, heartbeat, bind and lifecycle, and the "
+            "cdc/hid slave-transport selection with its Feature mailbox bootstrap."
         ),
         source=SOURCE_SLAVE_ASSETS,
         package="titella_slave_assets",

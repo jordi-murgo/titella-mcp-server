@@ -10,11 +10,21 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config
+from .keymap import (
+    SUPPORTED_LAYOUTS,
+    encode_steps,
+    firmware_direct_text,
+    normalize_text,
+    unreachable_characters,
+)
 from .screen import ScreenCapture
 from .serial_link import SerialLink, TransportError
 
 DEFAULT_LEASE_S = 600
 HARD_MAX_LEASE_S = 3600
+# Steps per kb_raw frame: 120 steps stay far below the 4096-byte wire frame
+# and below the firmware's own 512-step ceiling.
+RAW_STEPS_PER_FRAME = 120
 
 
 def _failure(code: str, message: str, *, retryable: bool = False, **details: Any) -> dict[str, Any]:
@@ -117,10 +127,25 @@ class HidLease:
 
 
 class HidController:
-    def __init__(self, link: SerialLink, lease: HidLease, screen: ScreenCapture) -> None:
+    """HID operations gated by the lease, except the lease-free emergency stop.
+
+    ``layout`` tracks the keyboard layout the firmware is actually typing
+    with. It starts from the configured preference and every successful
+    ``keyboard_layout`` call updates it, because the firmware layout is
+    runtime state that a configuration reload does not change.
+    """
+
+    def __init__(
+        self,
+        link: SerialLink,
+        lease: HidLease,
+        screen: ScreenCapture,
+        layout: str = "es_ES",
+    ) -> None:
         self.link = link
         self.lease = lease
         self.screen = screen
+        self.layout = layout if layout in SUPPORTED_LAYOUTS else "es_ES"
 
     def _request(self, owner: str, op: str, body: dict[str, Any]) -> dict[str, Any]:
         self.lease.require(owner)
@@ -131,7 +156,44 @@ class HidController:
             result["port"] = self.link.port
         return result
 
-    def mouse_abs(self, owner: str, x: int, y: int) -> dict[str, Any]:
+    def release_all(self) -> dict[str, Any]:
+        """Emergency stop: releases keys, modifiers and mouse buttons.
+
+        It owns no lease on purpose. A stuck key or a wedged mouse button has
+        to be clearable when the lease expired or another session holds it,
+        so this is the only HID op that skips ``lease.require``. The firmware
+        makes it idempotent.
+        """
+        frame = self.link.request("hid", "release_all", {})
+        result = dict(frame.get("body") or {})
+        result.setdefault("ok", True)
+        if self.link.port:
+            result["port"] = self.link.port
+        return result
+
+    @staticmethod
+    def _mouse_extras(
+        button: str | None, state: str
+    ) -> dict[str, Any] | None:
+        """Validates the optional mouse button/state pair; None means valid."""
+        if button is not None and button not in {"left", "right", "middle"}:
+            return _failure("invalid_argument", "unknown button")
+        if state not in {"keep", "down", "up"}:
+            return _failure("invalid_argument", "state must be keep, down or up")
+        return None
+
+    def mouse_abs(
+        self,
+        owner: str,
+        x: int,
+        y: int,
+        *,
+        button: str | None = None,
+        state: str = "keep",
+    ) -> dict[str, Any]:
+        failure = self._mouse_extras(button, state)
+        if failure is not None:
+            return failure
         resolution = self.screen.resolution()
         if resolution is None:
             return _failure("screen_required", "run screen first to calibrate coordinates")
@@ -141,21 +203,57 @@ class HidController:
                 "coordinates_out_of_bounds",
                 f"coordinates outside the {width}x{height} capture",
             )
+        if state in {"down", "up"} and button is None:
+            button = "left"
         hid_x = round(x * 32767 / (width - 1))
         hid_y = round(y * 32767 / (height - 1))
-        result = self._request(owner, "mouse_abs", {"x": hid_x, "y": hid_y})
+        body: dict[str, Any] = {"x": hid_x, "y": hid_y}
+        if button is not None or state != "keep":
+            # Only non-default requests carry the pair, so a plain move keeps
+            # the exact body older firmware already understands.
+            body["button"] = button
+            body["state"] = state
+        result = self._request(owner, "mouse_abs", body)
         result["coords"] = {"input_px": [x, y], "hid": [hid_x, hid_y], "capture_res": [width, height]}
         return result
 
-    def mouse_rel(self, owner: str, x: int, y: int) -> dict[str, Any]:
+    def mouse_rel(
+        self,
+        owner: str,
+        x: int,
+        y: int,
+        *,
+        button: str | None = None,
+        state: str = "keep",
+    ) -> dict[str, Any]:
         if not -127 <= x <= 127 or not -127 <= y <= 127:
             return _failure("invalid_argument", "mouse_rel requires x/y between -127 and 127")
-        return self._request(owner, "mouse_rel", {"x": x, "y": y})
+        failure = self._mouse_extras(button, state)
+        if failure is not None:
+            return failure
+        if state in {"down", "up"} and button is None:
+            button = "left"
+        body: dict[str, Any] = {"x": x, "y": y}
+        if button is not None or state != "keep":
+            body["button"] = button
+            body["state"] = state
+        return self._request(owner, "mouse_rel", body)
 
-    def click(self, owner: str, button: str = "left", double: bool = False) -> dict[str, Any]:
+    def click(
+        self,
+        owner: str,
+        button: str = "left",
+        double: bool = False,
+        state: str = "click",
+    ) -> dict[str, Any]:
         if button not in {"left", "right", "middle"}:
             return _failure("invalid_argument", "unknown button")
-        return self._request(owner, "mouse_click", {"button": button, "double": bool(double)})
+        if state not in {"click", "down", "up"}:
+            return _failure("invalid_argument", "state must be click, down or up")
+        body: dict[str, Any] = {"button": button, "double": bool(double)}
+        if state != "click":
+            body["state"] = state
+        return self._request(owner, "mouse_click", body)
 
     def wheel(self, owner: str, delta: int) -> dict[str, Any]:
         if not -127 <= delta <= 127:
@@ -165,10 +263,75 @@ class HidController:
     def key(self, owner: str, key: str, mods: list[str] | None = None) -> dict[str, Any]:
         return self._request(owner, "kb_key", {"key": key, "mods": list(mods or [])})
 
-    def type_text(self, owner: str, text: str, delay_ms: int = 10) -> dict[str, Any]:
-        return self._request(owner, "kb_text", {"text": text, "delay": delay_ms, "enter": False})
+    def type_text(
+        self, owner: str, text: str, delay_ms: int = 10, enter: bool = False
+    ) -> dict[str, Any]:
+        """Types literal text after validating the whole string.
+
+        Every character is checked against the tracked layout before a single
+        frame reaches the link, so an unsupported character reports
+        ``untypeable_characters`` with the complete ``unreachable`` list
+        instead of typing a prefix and leaving the target half-written.
+        Pure 7-bit ASCII the firmware's ASCII map understands travels as one
+        ``kb_text`` frame; anything else (dead keys, AltGr characters, the
+        ISO 102nd key) is emitted as ``kb_raw`` steps, in chunks sized for
+        the wire frame.
+        """
+        normalized = normalize_text(text)
+        unreachable = unreachable_characters(normalized, self.layout)
+        if unreachable:
+            return _failure(
+                "untypeable_characters",
+                f"text contains characters not supported by layout {self.layout}",
+                retryable=False,
+                layout=self.layout,
+                unreachable=unreachable,
+            )
+        if firmware_direct_text(normalized, self.layout):
+            return self._request(
+                owner,
+                "kb_text",
+                {"text": normalized, "delay": delay_ms, "enter": bool(enter)},
+            )
+        steps = encode_steps(normalized, self.layout)
+        if not steps:
+            # Nothing to type (empty text without the ASCII fast path, which
+            # an empty string never takes): an Enter-only request still has
+            # to reach the firmware.
+            return self._request(
+                owner, "kb_text", {"text": "", "delay": delay_ms, "enter": bool(enter)}
+            )
+        if getattr(self.link, "transport", None) == "window":
+            # The window transport injects exact Unicode characters, so the
+            # validated text travels alongside the steps and the ordinary
+            # wire-frame chunking (a UART limit) does not apply.
+            return self._request(
+                owner,
+                "kb_raw",
+                {"steps": steps, "text": normalized, "delay": delay_ms, "enter": bool(enter)},
+            )
+        result: dict[str, Any] = {}
+        chunks = [
+            steps[index:index + RAW_STEPS_PER_FRAME]
+            for index in range(0, len(steps), RAW_STEPS_PER_FRAME)
+        ]
+        for index, chunk in enumerate(chunks):
+            last = index == len(chunks) - 1
+            result = self._request(
+                owner,
+                "kb_raw",
+                {"steps": chunk, "delay": delay_ms, "enter": bool(enter) and last},
+            )
+            if not result.get("ok"):
+                return result
+        if len(chunks) > 1:
+            result["chunks"] = len(chunks)
+        return result
 
     def keyboard_layout(self, owner: str, layout: str) -> dict[str, Any]:
-        if layout not in {"es_ES", "en_US"}:
+        if layout not in SUPPORTED_LAYOUTS:
             return _failure("invalid_argument", "unsupported layout")
-        return self._request(owner, "kb_layout", {"layout": layout})
+        result = self._request(owner, "kb_layout", {"layout": layout})
+        if result.get("ok", False):
+            self.layout = layout
+        return result

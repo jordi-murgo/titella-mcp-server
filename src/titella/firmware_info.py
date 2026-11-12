@@ -41,6 +41,19 @@ class FirmwareInfo:
                 "firmware": body.get("firmware"),
                 "protocol": body.get("protocol"),
                 "uart_baud": body.get("uart_baud"),
+                # The slave-transport capability travels in the same health
+                # reply: the bootstrap needs it to decide HID without a second
+                # query, and status reports it without a separate probe.
+                "slave_transports": body.get("slave_transports"),
+                "slave_transport": body.get("slave_transport"),
+                "hid_data_protocol": body.get("hid_data_protocol"),
+                "usb_vid": body.get("usb_vid"),
+                "usb_pid": body.get("usb_pid"),
+                "usb_serial": body.get("usb_serial"),
+                # Read-only state of the destination the firmware forwards to
+                # right now; the stop path proves a close with it instead of
+                # inferring it from an RPC failure.
+                "slave_connected": body.get("slave_connected"),
                 "port": self._link.port,
                 "transport": getattr(self._link, "transport", "serial"),
                 "wifi": body.get("wifi"),

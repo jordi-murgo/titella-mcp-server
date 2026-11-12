@@ -344,9 +344,12 @@ class RegistrationTests(unittest.TestCase):
             documentation.SERVER_INSTRUCTIONS,
             "Use docs_index to discover Titella procedures and docs_read to read "
             "them. Read getting-started before operating a rig and the "
-            "platform-specific bootstrap guide before slave_bootstrap. "
-            "Documentation does not report live device state; use kvm_status "
-            "for that.",
+            "platform-specific bootstrap guide before slave_bootstrap. Before "
+            "each bootstrap, check the target window's active keyboard layout "
+            "with screen, pass that layout explicitly and set "
+            "layout_confirmed=true only if freshly verified; stop if it cannot "
+            "be established. Documentation does not report live device state; "
+            "use kvm_status for that.",
         )
         self.assertIn("docs_index", documentation.SERVER_INSTRUCTIONS)
         self.assertIn("kvm_status", documentation.SERVER_INSTRUCTIONS)
