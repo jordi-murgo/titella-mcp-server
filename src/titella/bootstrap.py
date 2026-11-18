@@ -79,6 +79,11 @@ _HID_CONTAINER_MARKER = "#@#"
 # Add-Type of the transport unit from a file) needed this headroom after the
 # trims; validation semantics are never cut to stay under it.
 _HID_STAGE0_MAX_CHARS = 3328
+# Characters per typed stage-0 input line. Windows hands a console reader at
+# most ~254 characters per ReadLine(); a longer line arrives truncated (a
+# 2,980-character line yielded 254 and "Invalid length for a Base-64 char
+# array or string"). 200 leaves margin for the echo and line discipline.
+_HID_STAGE0_LINE_CHARS = 200
 # The firmware identifies this rig with a fixed vendor/product pair; the HID
 # bootstrap requires exactly it, so an unrelated 0xFF00 collection is refused.
 _HID_USB_VID = 6127
@@ -422,12 +427,18 @@ def windows_clipboard_stub_command(link_id: str) -> str:
 
 def windows_hid_stage0_input(stage0_source: str, token: str, size: int,
                              sha256: str) -> tuple[str, str]:
-    """Return a short launcher and the stage-0 Base64 line read from stdin.
+    """Return a short launcher and the stage-0 Base64 input read from stdin.
 
     The stage-0 script pulls the verified loader and transport container from
-    the Feature 0x11 snapshot. Both input lines must be typable on es_ES; the
-    caller checks their combined keystroke budget before staging the snapshot.
-    Console input can still be echoed or recorded by other Windows facilities.
+    the Feature 0x11 snapshot. The Base64 travels as several lines because the
+    guest console hands a reader at most ~254 characters per ``ReadLine()``
+    (measured on Windows 11: a 2,980-character single line arrived as 254 and
+    died with "Invalid length for a Base-64 char array or string"). The
+    launcher therefore accumulates lines until a terminator, and every line is
+    bounded so no fragment can be truncated. Both the launcher and each line
+    must be typable on es_ES; the caller checks the combined keystroke budget
+    before staging the snapshot. Console input can still be echoed or recorded
+    by other Windows facilities.
     """
     if not isinstance(stage0_source, str) or not stage0_source:
         raise ValueError("stage0_source must be a non-empty string")
@@ -447,8 +458,16 @@ def windows_hid_stage0_input(stage0_source: str, token: str, size: int,
         .replace("__HID_SHA256__", sha256.lower())
     )
     encoded = base64.b64encode(gzip.compress(rendered.encode("utf-8"), mtime=0)).decode("ascii")
+    # ReadLine() delivers at most a fragment of a long line, so the launcher
+    # collects bounded lines until the terminator and stops at the declared
+    # length: one more guard against a short fragment being accepted.
     launcher = (
-        "$m=[IO.MemoryStream]::new([Convert]::FromBase64String([Console]::ReadLine()));"
+        "$b='';"
+        "while($true){"
+        "$l=[Console]::ReadLine();"
+        "if($l -ceq 'END'){break};"
+        "$b+=$l};"
+        "$m=[IO.MemoryStream]::new([Convert]::FromBase64String($b));"
         "$r=[IO.StreamReader]::new([IO.Compression.GzipStream]::new($m,([IO.Compression.CompressionMode]0)));"
         "iex $r.ReadToEnd()"
     )
@@ -1034,18 +1053,28 @@ class BootstrapManager:
                 )
 
             if slave_transport == "hid":
-                # Publish the snapshot before typing the launcher and its
-                # separate stdin line into the operator-prepared console.
+                # Publish the snapshot before typing the launcher and the
+                # Base64 lines into the operator-prepared console. The lines
+                # are bounded because Windows hands a console reader at most
+                # ~254 characters per ReadLine(): a longer line arrives cut and
+                # the microloader then fails with an invalid Base64 length.
                 stage_started = time.monotonic()
                 self._stage_hid_snapshot(stage_token, compressed)
                 self._set(status="stage0_typed",
                           stage_elapsed_s=round(time.monotonic() - stage_started, 3))
-                for line in (stage0_command, stage0_payload):
+                for line in (stage0_command,):
                     for position in range(0, len(line), _HID_CHUNK_CHARS):
                         self.hid.type_text(
                             owner, line[position:position + _HID_CHUNK_CHARS],
                             _WINDOWS_TYPE_DELAY_MS,
                         )
+                    self.hid.key(owner, "ENTER", [])
+                payload_lines = [
+                    stage0_payload[index:index + _HID_STAGE0_LINE_CHARS]
+                    for index in range(0, len(stage0_payload), _HID_STAGE0_LINE_CHARS)
+                ] + ["END"]
+                for line in payload_lines:
+                    self.hid.type_text(owner, line, _WINDOWS_TYPE_DELAY_MS)
                     self.hid.key(owner, "ENTER", [])
                 self._set(status="waiting_loader")
                 with self._clipboard_hold():

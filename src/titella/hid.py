@@ -25,6 +25,10 @@ HARD_MAX_LEASE_S = 3600
 # Steps per kb_raw frame: 120 steps stay far below the 4096-byte wire frame
 # and below the firmware's own 512-step ceiling.
 RAW_STEPS_PER_FRAME = 120
+# Characters per kb_text frame. The guest console delivers only the first
+# fragment of a long burst to its reader (measured: 254 of 2,980), so the
+# ASCII fast path is chunked like the raw one instead of trusting the wire.
+TEXT_CHARS_PER_FRAME = 200
 
 
 def _failure(code: str, message: str, *, retryable: bool = False, **details: Any) -> dict[str, Any]:
@@ -272,10 +276,14 @@ class HidController:
         frame reaches the link, so an unsupported character reports
         ``untypeable_characters`` with the complete ``unreachable`` list
         instead of typing a prefix and leaving the target half-written.
-        Pure 7-bit ASCII the firmware's ASCII map understands travels as one
-        ``kb_text`` frame; anything else (dead keys, AltGr characters, the
-        ISO 102nd key) is emitted as ``kb_raw`` steps, in chunks sized for
-        the wire frame.
+        Pure 7-bit ASCII the firmware's ASCII map understands travels as
+        ``kb_text`` frames; anything else (dead keys, AltGr characters, the
+        ISO 102nd key) is emitted as ``kb_raw`` steps. Both paths are chunked:
+        a single long frame loses its tail, because the guest's console
+        delivers only the first fragment to the reader. The observed failure
+        was ``Console::ReadLine()`` returning 254 of a 2,980-character
+        base64 line, which surfaced as "Invalid length for a Base-64 char
+        array or string" inside the stage-0 microloader.
         """
         normalized = normalize_text(text)
         unreachable = unreachable_characters(normalized, self.layout)
@@ -288,11 +296,23 @@ class HidController:
                 unreachable=unreachable,
             )
         if firmware_direct_text(normalized, self.layout):
-            return self._request(
-                owner,
-                "kb_text",
-                {"text": normalized, "delay": delay_ms, "enter": bool(enter)},
-            )
+            pieces = [
+                normalized[index:index + TEXT_CHARS_PER_FRAME]
+                for index in range(0, len(normalized), TEXT_CHARS_PER_FRAME)
+            ]
+            result: dict[str, Any] = {}
+            for index, piece in enumerate(pieces):
+                last = index == len(pieces) - 1
+                result = self._request(
+                    owner,
+                    "kb_text",
+                    {"text": piece, "delay": delay_ms, "enter": bool(enter) and last},
+                )
+                if not result.get("ok"):
+                    return result
+            if len(pieces) > 1:
+                result["chunks"] = len(pieces)
+            return result
         steps = encode_steps(normalized, self.layout)
         if not steps:
             # Nothing to type (empty text without the ASCII fast path, which

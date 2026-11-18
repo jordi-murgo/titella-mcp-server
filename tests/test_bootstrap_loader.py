@@ -68,18 +68,47 @@ class HidStage0CommandTests(unittest.TestCase):
                                      hashlib.sha256(b"x").hexdigest())
 
     @unittest.skipUnless(shutil.which("pwsh"), "PowerShell is not installed")
-    def test_launcher_reads_and_executes_the_separate_input_line(self) -> None:
+    def test_launcher_accumulates_bounded_lines_until_the_terminator(self) -> None:
+        """A single long line cannot cross a Windows console reader.
+
+        Measured on Windows 11: a 2,980-character line reached
+        ``[Console]::ReadLine()`` as 254 characters. The launcher therefore
+        concatenates bounded lines and stops at ``END``.
+        """
         source = STAGE0 + "[Console]::WriteLine('RESULT:' + $tok + ':' + $size + ':' + $sha)\n"
         digest = hashlib.sha256(b"loader").hexdigest()
         command, payload = windows_hid_stage0_input(source, "0123456789abcdef", 10, digest)
         self.assertIn("[Console]::ReadLine()", command)
+        self.assertIn("-ceq 'END'", command)
         self.assertNotIn(payload, command)
+        lines = [payload[index:index + 200] for index in range(0, len(payload), 200)] + ["END"]
+        self.assertTrue(all(len(line) <= 200 for line in lines))
         result = subprocess.run(
             [shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-Command", command],
-            input=payload + "\n", text=True, capture_output=True, timeout=30, check=False,
+            input="\n".join(lines) + "\n", text=True, capture_output=True, timeout=30,
+            check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("RESULT:0123456789ABCDEF:10:" + digest, result.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell is not installed")
+    def test_launcher_reassembles_the_payload_across_readline_boundaries(self) -> None:
+        """The concatenation is what makes a >254-character input survive."""
+        # Realistic template size: a short one gzips below the boundary and
+        # would not exercise the reassembly at all.
+        filler = "".join(f"$v{i} = {i}\n" for i in range(400))
+        source = STAGE0 + filler + "[Console]::WriteLine('OK:' + $sha.Length)\n"
+        digest = hashlib.sha256(b"loader").hexdigest()
+        command, payload = windows_hid_stage0_input(source, "0123456789abcdef", 300, digest)
+        self.assertGreater(len(payload), 254)
+        lines = [payload[index:index + 200] for index in range(0, len(payload), 200)] + ["END"]
+        result = subprocess.run(
+            [shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-Command", command],
+            input="\n".join(lines) + "\n", text=True, capture_output=True, timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("OK:64", result.stdout)
 
 
 class HidRenderTests(unittest.TestCase):

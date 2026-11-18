@@ -83,6 +83,18 @@ class FakeHid:
                 current = []
         return lines
 
+    def entered_payload(self) -> str:
+        """The Base64 payload as the microloader reassembles it.
+
+        Lines are bounded (~200 chars) because a Windows console reader cuts a
+        longer line; the launcher concatenates them until ``END``.
+        """
+        lines = self.entered_lines()
+        body = lines[1:]
+        if body and body[-1] == "END":
+            body = body[:-1]
+        return "".join(body)
+
 
 class FakeLink:
     def __init__(self) -> None:
@@ -944,7 +956,8 @@ class HidBootstrapTests(unittest.TestCase):
             # The destination is selected before the layout is touched.
             self.assertEqual(
                 ops.index("slave_transport") < ops.index("loader_stage_begin"), True)
-            command, payload = hid.entered_lines()
+            command = hid.entered_lines()[0]
+            payload = hid.entered_payload()
             self.assertIn("[Console]::ReadLine()", command)
             self.assertNotIn(payload, command)
             self.assertIn("Titella.HW", _ungzip_stage0(payload))
@@ -978,7 +991,8 @@ class HidBootstrapTests(unittest.TestCase):
             self.assertIn("$script:Fmt = 'dll'", loader)
             self.assertNotIn("__AGENT_FORMAT__", loader)
             self.assertIn("namespace Titella.Slave", transport)
-            command, payload = hid.entered_lines()
+            command = hid.entered_lines()[0]
+            payload = hid.entered_payload()
             self.assertIn("[Console]::ReadLine()", command)
             self.assertIn("Titella.HW", _ungzip_stage0(payload))
 
@@ -1018,7 +1032,8 @@ class HidBootstrapTests(unittest.TestCase):
             self.assertIn("class HidByteStream", transport)
             self.assertIn("def open_stream", transport)
             self.assertNotIn("namespace Titella.Slave", transport)
-            command, payload = hid.entered_lines()
+            command = hid.entered_lines()[0]
+            payload = hid.entered_payload()
             self.assertIn("[Console]::ReadLine()", command)
             self.assertIn("hid_transport.py", _ungzip_stage0(payload))
             self.assertNotIn("csc.exe", command + payload)
