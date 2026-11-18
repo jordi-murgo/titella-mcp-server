@@ -20,6 +20,8 @@ from titella_slave_assets.wire import DATA_CHUNK_BYTES, DATA_WINDOW_DEFAULT, DAT
 
 MAX_CONVENIENCE_WRITE = 64 * 1024
 MAX_TRANSFER_BYTES = 512 * 1024 * 1024
+# Bounded wait for transfer workers to seal evidence and drop partials on close.
+WORKER_JOIN_TIMEOUT_S = 5.0
 
 # fs.screen: one still image of the primary monitor of a running agent. The
 # metadata request keeps the ordinary 65 s ceiling, so the server-side worst
@@ -115,6 +117,10 @@ class TransferState:
     final_path: Path | None = None
     hasher: Any = field(default_factory=hashlib.sha256)
     next_seq: int = 0
+    # Optional audit identity: set before worker threads start.
+    audit_call: Any = None
+    audit_evidence_id: str | None = None
+    worker_thread: Any = None
 
 
 class FilesClient:
@@ -124,10 +130,34 @@ class FilesClient:
         self._streams: dict[str, StreamCollector] = {}
         self._transfers: dict[str, TransferState] = {}
         self._lock = threading.Lock()
+        self.audit_manager: Any = None
+        self.audit_titella_id: str = "default"
+        self._workers_lock = threading.Lock()
+        self._worker_threads: list[threading.Thread] = []
+        self._closed = False
         self._unsubscribe_fs = link.subscribe("fs", self._on_fs)
         self._unsubscribe_transfer = link.subscribe("transfer", self._on_transfer)
 
+    def _start_worker(self, target: Any, args: tuple[Any, ...], name: str) -> threading.Thread:
+        """Starts a transfer worker and remembers it for deterministic close."""
+        thread = threading.Thread(target=target, args=args, name=name, daemon=True)
+        with self._workers_lock:
+            self._worker_threads = [t for t in self._worker_threads if t.is_alive()]
+            self._worker_threads.append(thread)
+        thread.start()
+        return thread
+
     def close(self) -> None:
+        """Cancels transfers and lets their workers seal evidence before exit.
+
+        Workers close their evidence stream, delete the download partial and
+        then set ``done``; joining them (bounded, never self) means no settled
+        transfer outlives the client and no partial file is unlinked while a
+        worker still writes it.
+        """
+        if self._closed:
+            return
+        self._closed = True
         self._unsubscribe_fs()
         self._unsubscribe_transfer()
         with self._lock:
@@ -137,10 +167,30 @@ class FilesClient:
             if transfer.stream:
                 try:
                     transfer.stream.close()
+                except (OSError, ValueError, AttributeError):
+                    pass
+        with self._workers_lock:
+            threads = list(self._worker_threads)
+            self._worker_threads = []
+        current = threading.current_thread()
+        for thread in threads:
+            if thread is current:
+                # A worker closing its own client must not join itself.
+                continue
+            thread.join(timeout=WORKER_JOIN_TIMEOUT_S)
+        for transfer in transfers:
+            if not transfer.done.is_set():
+                # A worker stuck in a blocking link call must not leave a
+                # waiter hanging after close.
+                transfer.done.set()
+        # Workers delete their own partials; this sweep only covers transfers
+        # whose worker never ran or could not finish within the bound.
+        for transfer in transfers:
+            if transfer.temporary:
+                try:
+                    transfer.temporary.unlink(missing_ok=True)
                 except OSError:
                     pass
-            if transfer.temporary:
-                transfer.temporary.unlink(missing_ok=True)
 
     def _on_fs(self, frame: dict[str, Any]) -> bool:
         session_id = frame.get("session_id")
@@ -197,6 +247,16 @@ class FilesClient:
             transfer.hasher.update(data)
             transfer.bytes_transferred += len(data)
             transfer.next_seq += 1
+            # The block was accepted (written, hashed, sequenced) before the
+            # sink is touched: an audit failure may lose evidence but can
+            # never change this ACK or the reader's return value.
+            if self.audit_manager is not None and transfer.audit_evidence_id:
+                try:
+                    self.audit_manager.append_stream(
+                        transfer.audit_evidence_id, data, wire_seq=int(frame["seq"])
+                    )
+                except Exception:
+                    pass
         elif frame["type"] == "event" and frame.get("op") in {"transfer.finished", "transfer.progress"}:
             transfer.result = dict(frame.get("body") or {})
             if frame.get("op") == "transfer.finished":
@@ -417,6 +477,41 @@ class FilesClient:
         result["_resolution"] = resolution
         return result
 
+    def _close_transfer_evidence(self, transfer: TransferState, direction: str) -> None:
+        """Seals the transfer evidence before done is set.
+
+        Called after local verification, so the recorded outcome is the
+        verified one (checksum ok or failed, cancelled, partial). An audit
+        failure never aborts the caller's cleanup: the manager faults itself
+        and the executed transfer result stands.
+        """
+        audit = self.audit_manager
+        if audit is None or transfer.audit_call is None:
+            return
+        try:
+            if transfer.audit_evidence_id:
+                audit.close_stream(
+                    transfer.audit_evidence_id,
+                    complete=(transfer.status == "finished"),
+                    reason=f"{direction}:{transfer.status}",
+                    final_status={
+                        "status": transfer.status,
+                        "sha256": transfer.sha256,
+                        "bytes_total": transfer.bytes_total,
+                        "bytes_transferred": transfer.bytes_transferred,
+                        "error": transfer.error,
+                    },
+                )
+            audit.finish_operation(
+                transfer.audit_call, "transfer", transfer.transfer_id,
+                {"operation_kind": direction, "status": transfer.status,
+                 "sha256": transfer.sha256,
+                 "bytes_transferred": transfer.bytes_transferred,
+                 "error": transfer.error},
+            )
+        except Exception:
+            pass
+
     def upload(
         self,
         local_path: str,
@@ -432,14 +527,25 @@ class FilesClient:
         if size > MAX_TRANSFER_BYTES:
             raise ValueError("the transfer exceeds 512 MiB")
         transfer = TransferState(uuid.uuid4().hex, "upload", bytes_total=size)
+        if self.audit_manager is not None:
+            from .audit import current_audit_call
+            transfer.audit_call = current_audit_call()
+            if transfer.audit_call is not None:
+                self.audit_manager.bind_operation(
+                    transfer.audit_call, "transfer", transfer.transfer_id, "upload"
+                )
+                transfer.audit_evidence_id = self.audit_manager.open_stream(
+                    transfer.audit_call, role="upload", channel="transfer",
+                    operation_id=transfer.transfer_id,
+                    titella_id=transfer.audit_call.titella_id,
+                )
         with self._lock:
             self._transfers[transfer.transfer_id] = transfer
-        threading.Thread(
-            target=self._upload_worker,
-            args=(transfer, source, remote_path, window),
-            name=f"upload-{transfer.transfer_id[:8]}",
-            daemon=True,
-        ).start()
+        transfer.worker_thread = self._start_worker(
+            self._upload_worker,
+            (transfer, source, remote_path, window),
+            f"upload-{transfer.transfer_id[:8]}",
+        )
         return self._wait_transfer(transfer, sync_timeout)
 
     def _upload_worker(
@@ -465,15 +571,49 @@ class FilesClient:
                 "sha256": transfer.sha256,
             }, timeout=10)
             with source.open("rb") as stream:
+                audit = self.audit_manager
+                audit_stream = transfer.audit_evidence_id
+                audit_call = transfer.audit_call
+                acked_milestone = 0
+                progress_step = 1024 * 1024
+
                 def read_chunk() -> bytes:
                     if transfer.cancelled.is_set():
                         raise TransportError(
                             "cancelled", "upload cancelled", False, session_id=transfer.transfer_id,
                         )
-                    return stream.read(DATA_CHUNK_BYTES)
+                    # The bytes really read here are exactly what goes on the
+                    # wire; the source is not reopened after the transfer.
+                    block = stream.read(DATA_CHUNK_BYTES)
+                    if block and audit is not None and audit_stream:
+                        try:
+                            audit.append_stream(audit_stream, block)
+                        except Exception:
+                            # Never abort the transfer on an audit failure:
+                            # the block is already read and about to be sent.
+                            pass
+                    return block
 
                 def on_ack(total: int) -> None:
+                    nonlocal acked_milestone
                     transfer.bytes_transferred = total
+                    if (
+                        audit is None or audit_call is None
+                        or total - acked_milestone < progress_step
+                    ):
+                        return
+                    acked_milestone = total
+                    try:
+                        # ACK milestones keep journaled progress observable
+                        # without one event per 512-byte block.
+                        audit.operation_progress(
+                            audit_call, "transfer", transfer.transfer_id,
+                            {"operation_kind": "upload", "acked_bytes": total,
+                             "bytes_total": transfer.bytes_total,
+                             "complete": total == transfer.bytes_total},
+                        )
+                    except Exception:
+                        pass
 
                 self.link.stream_data(
                     "transfer",
@@ -494,6 +634,8 @@ class FilesClient:
         except BaseException as exc:
             self._transfer_failed(transfer, exc)
         finally:
+            # Evidence closes with the verified outcome before done is set.
+            self._close_transfer_evidence(transfer, "upload")
             transfer.done.set()
 
     def download(
@@ -510,14 +652,25 @@ class FilesClient:
         destination = Path(local_path).expanduser()
         destination.parent.mkdir(parents=True, exist_ok=True)
         transfer = TransferState(uuid.uuid4().hex, "download", final_path=destination)
+        if self.audit_manager is not None:
+            from .audit import current_audit_call
+            transfer.audit_call = current_audit_call()
+            if transfer.audit_call is not None:
+                self.audit_manager.bind_operation(
+                    transfer.audit_call, "transfer", transfer.transfer_id, "download"
+                )
+                transfer.audit_evidence_id = self.audit_manager.open_stream(
+                    transfer.audit_call, role="download", channel="transfer",
+                    operation_id=transfer.transfer_id,
+                    titella_id=transfer.audit_call.titella_id,
+                )
         with self._lock:
             self._transfers[transfer.transfer_id] = transfer
-        threading.Thread(
-            target=self._download_worker,
-            args=(transfer, remote_path, checksum, window),
-            name=f"download-{transfer.transfer_id[:8]}",
-            daemon=True,
-        ).start()
+        transfer.worker_thread = self._start_worker(
+            self._download_worker,
+            (transfer, remote_path, checksum, window),
+            f"download-{transfer.transfer_id[:8]}",
+        )
         return self._wait_transfer(transfer, sync_timeout)
 
     def _download_worker(
@@ -575,8 +728,15 @@ class FilesClient:
             if transfer.stream:
                 transfer.stream.close()
                 transfer.stream = None
+            # Evidence seals with the verified outcome before the partial is
+            # deleted and before done is set, so the audit keeps the bytes the
+            # client drops and no waiter sees a settled transfer early.
+            self._close_transfer_evidence(transfer, "download")
             if transfer.temporary:
-                transfer.temporary.unlink(missing_ok=True)
+                try:
+                    transfer.temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
             transfer.done.set()
 
     def _transfer_failed(self, transfer: TransferState, exc: BaseException) -> None:
@@ -607,9 +767,13 @@ class FilesClient:
         }
         if transfer.sha256:
             result["sha256"] = transfer.sha256
+        result.update(transfer.result)
+        # The wire body is the remote view, not the verified one: a local
+        # checksum/size failure (or cancellation) must never be reported as
+        # the remote's "finished". Local verification wins.
+        result["status"] = transfer.status
         if transfer.error:
             result["error"] = transfer.error
-        result.update(transfer.result)
         return result
 
     def transfer_cancel(self, transfer_id: str) -> dict[str, Any]:

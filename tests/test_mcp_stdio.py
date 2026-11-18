@@ -36,10 +36,13 @@ from titella_slave_assets.wire import (
 
 LINK = "0123456789abcdef0123456789abcdef"
 ROOT = Path(__file__).resolve().parents[1]
-DOCUMENTATION_IDS = (
-    "bootstrap-python", "bootstrap-windows", "getting-started", "mcp-transport",
-    "operation", "serial-protocol", "troubleshooting",
+# Derived from the packaged catalog at import time: adding a document must
+# not require editing this list; the three audit documents are still pinned.
+from titella.documentation import list_documents as _list_documents
+DOCUMENTATION_IDS = tuple(
+    entry["id"] for entry in _list_documents()["documents"]
 )
+REQUIRED_AUDIT_DOCUMENT_IDS = ("audit-mode", "audit-report-skill", "work-protocol")
 
 
 class FakeFirmware:
@@ -165,7 +168,7 @@ class McpStdioTests(unittest.TestCase):
         self.firmware = FakeFirmware(self.uart_master, self.cdc_master)
         self.addCleanup(self.firmware.close)
 
-        self.server_env = dict(os.environ)
+        self.server_env = {key: value for key, value in os.environ.items() if not key.startswith("TITELLA_")}
         self.server_env.update({
             # Explicit path: the operator's TOML must not leak into the test.
             # No PYTHONPATH is injected: every subprocess must resolve the
@@ -174,6 +177,7 @@ class McpStdioTests(unittest.TestCase):
             "TITELLA_CONFIG": str(self.root / "absent.toml"),
             "TITELLA_SERIAL_PORT": self.uart_name,
             "TITELLA_STATE_DIR": str(state),
+            "TITELLA_AUDIT_ROOT": str(self.root / "audits"),
             "TITELLA_HEARTBEAT_S": "1",
             "TITELLA_DISCONNECT_GRACE_S": "5",
             "TITELLA_SCREEN_DEVICE": "no-such-capture-device",
@@ -259,6 +263,8 @@ class McpStdioTests(unittest.TestCase):
                 "remote_fs_replace", "remote_fs_search", "remote_fs_find", "remote_sysinfo",
                 "remote_upload", "remote_download", "remote_transfer_status", "remote_transfer_cancel",
                 "kvm_status", "docs_index", "docs_read",
+                "audit_activate", "audit_deactivate", "audit_status", "audit_list",
+                "audit_note", "audit_search", "audit_read", "audit_export",
             }
             self.assertEqual(expected - tools, set())
 
@@ -268,6 +274,7 @@ class McpStdioTests(unittest.TestCase):
             index = _payload_text(await session.call_tool("docs_index", {}))
             catalog = {entry["id"]: entry for entry in index["documents"]}
             self.assertEqual(sorted(catalog), sorted(DOCUMENTATION_IDS))
+            self.assertLessEqual(set(REQUIRED_AUDIT_DOCUMENT_IDS), set(catalog))
             self.assertEqual(index["server_version"], server_version)
             self.assertEqual(index["slave_assets_version"], assets_version)
             self.assertEqual(catalog["getting-started"]["source"], "titella")
@@ -304,10 +311,10 @@ class McpStdioTests(unittest.TestCase):
             self.assertEqual(
                 announced, {f"titella://docs/{document_id}" for document_id in DOCUMENTATION_IDS}
             )
-            for document_id, expected_document in (
-                ("getting-started", server_document),
-                ("bootstrap-python", slave_document),
-            ):
+            for document_id in catalog:
+                expected_document = _payload_text(await session.call_tool(
+                    "docs_read", {"document_id": document_id},
+                ))
                 read = await session.read_resource(f"titella://docs/{document_id}")
                 body = read.contents[0]
                 self.assertEqual(body.mimeType, "text/markdown")

@@ -28,8 +28,13 @@ def create_app(config: Config) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        async with mcp_app.router.lifespan_context(mcp_app):
-            yield
+        try:
+            async with mcp_app.router.lifespan_context(mcp_app):
+                yield
+        finally:
+            # Normal shutdown closes instances first, then drains the audit
+            # writer; create_server's atexit stays as an idempotent backup.
+            registry.close_all()
 
     app = FastAPI(
         title="Titella MCP",

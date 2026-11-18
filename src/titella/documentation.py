@@ -1,6 +1,6 @@
 """Canonical Titella documentation served through MCP.
 
-Two halves, one catalog: the four server documents travel inside the
+Two halves, one catalog: the server documents travel inside the
 ``titella`` wheel under ``_docs/`` and the three slave documents travel inside
 the pinned ``titella-slave-assets`` wheel under ``_data/docs/``. Every read
 goes through ``importlib.resources``: no checkout path, URL, network request
@@ -36,12 +36,18 @@ SOURCE_SLAVE_ASSETS = "titella-slave-assets"
 
 SERVER_INSTRUCTIONS = (
     "Use docs_index to discover Titella procedures and docs_read to read them. "
-    "Read getting-started before operating a rig and the platform-specific "
-    "bootstrap guide before slave_bootstrap. Before each bootstrap, check the "
-    "target window's active keyboard layout with screen, pass that layout "
-    "explicitly and set layout_confirmed=true only if freshly verified; stop "
-    "if it cannot be established. Documentation does not report live device "
-    "state; use kvm_status for that."
+    "Follow the work-protocol document for every session: read docs, confirm "
+    "the authorized scope and instance, kvm_status, fresh screen, lease, "
+    "keyboard probe in the destination console before typing, one operation "
+    "at a time, verify, then wind down. Read getting-started before operating "
+    "a rig and the platform-specific bootstrap guide before slave_bootstrap. "
+    "Before each bootstrap, check the target window's active keyboard layout "
+    "with screen, pass that layout explicitly and set layout_confirmed=true "
+    "only if freshly verified; stop if it cannot be established. When the "
+    "operator requests an audit, read audit-mode first and use the "
+    "audit_report skill (audit-report-skill) to draft reports from an "
+    "export. Documentation does not report live device state; use "
+    "kvm_status for that."
 )
 
 
@@ -73,6 +79,32 @@ class _Document:
 
 _CATALOG: tuple[_Document, ...] = (
     _Document(
+        document_id="audit-mode",
+        title="Audit mode",
+        description=(
+            "Evidence recording by audit name and instance: activation, "
+            "events and artifacts, integrity and recovery, error codes, "
+            "offline search/read/export and provenance rules."
+        ),
+        source=SOURCE_TITELLA,
+        package="titella",
+        directory=("_docs",),
+        filename="audit-mode.md",
+    ),
+    _Document(
+        document_id="audit-report-skill",
+        title="Titella audit report skill",
+        description=(
+            "Skill that drafts an evidence-linked Markdown report from a "
+            "Titella audit export: activation contract, hard rules, gates, "
+            "steps and output contract."
+        ),
+        source=SOURCE_TITELLA,
+        package="titella",
+        directory=("_docs",),
+        filename="audit-report-skill.md",
+    ),
+    _Document(
         document_id="bootstrap-python",
         title="Bootstrap the Python slave agent",
         description=(
@@ -96,6 +128,20 @@ _CATALOG: tuple[_Document, ...] = (
         package="titella_slave_assets",
         directory=("_data", "docs"),
         filename="bootstrap-windows.md",
+    ),
+    _Document(
+        document_id="bootstrap-windows-python",
+        title="Bootstrap the Windows Python slave agent",
+        description=(
+            "The USB-only Windows agent that needs a Python 3.9+ interpreter "
+            "instead of PowerShell 5.1 with the .NET Framework compiler: "
+            "interpreter discovery, the HID stage-0 mailbox, the zipapp payload, "
+            "footprint and error codes."
+        ),
+        source=SOURCE_SLAVE_ASSETS,
+        package="titella_slave_assets",
+        directory=("_data", "docs"),
+        filename="bootstrap-windows-python.md",
     ),
     _Document(
         document_id="getting-started",
@@ -146,6 +192,19 @@ _CATALOG: tuple[_Document, ...] = (
         package="titella_slave_assets",
         directory=("_data", "docs"),
         filename="serial-protocol.md",
+    ),
+    _Document(
+        document_id="work-protocol",
+        title="Titella work protocol",
+        description=(
+            "Required session order: docs, scope, audit activation, status, "
+            "fresh capture, lease, keyboard probe, bootstrap, one operation "
+            "at a time, verification and shutdown."
+        ),
+        source=SOURCE_TITELLA,
+        package="titella",
+        directory=("_docs",),
+        filename="work-protocol.md",
     ),
     _Document(
         document_id="troubleshooting",
@@ -312,7 +371,7 @@ def _resource_handler(document_id: str) -> Any:
 
 
 def register_documentation(server: "FastMCP") -> None:
-    """Registers the two tools and the seven fixed resources exactly once.
+    """Registers the two tools and one fixed resource per catalog entry.
 
     The handlers read packaged assets only: no lease, gate, firmware, HID or
     daemon-state call is made here, so documentation is readable with the rig

@@ -9,6 +9,7 @@ rectangle.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import urllib.error
 import urllib.request
@@ -149,30 +150,94 @@ def run_ocr(
             "run screen first before running screen_ocr",
             retryable=False,
         )
+    capture_lock = getattr(capture, "_capture_lock", None)
+    audit_sink = getattr(capture, "evidence_sink", None)
+
+    def _snapshot() -> dict[str, Any]:
+        # Bytes, diff envelope and auditable reference are read in one go:
+        # a concurrent capture cannot pair this frame's bytes with another
+        # frame's provenance or bbox.
+        image_bytes = capture.last_frame_path.read_bytes()
+        return {
+            "image": image_bytes,
+            "last": getattr(capture, "_last_evidence", None),
+            "diff": capture.last_diff() if scope == "diff" else None,
+            "provenance": (
+                audit_sink.current_provenance() if audit_sink is not None else None
+            ),
+        }
+
     try:
-        image = capture.last_frame_path.read_bytes()
+        if capture_lock is None:
+            snapshot = _snapshot()
+        else:
+            with capture_lock:
+                snapshot = _snapshot()
     except OSError as exc:
         return _failure(
             "screen_state_failed",
             f"the last frame cannot be read: {exc}",
             retryable=True,
         )
+    image: bytes = snapshot["image"]
+    last: dict[str, Any] | None = snapshot["last"]
+    last_diff: dict[str, Any] = snapshot["diff"] or {}
+    provenance: dict[str, Any] | None = snapshot["provenance"]
+    # The frame hash exists only as audit provenance: no hashing work happens
+    # while the audit is inactive.
+    image_sha256: str = (
+        hashlib.sha256(image).hexdigest() if provenance is not None else ""
+    )
+    if provenance is not None:
+        # Under an active audit, OCR consumes only a fresh capture of that
+        # audit and run: a pre-activation cache, another audit's frame or a
+        # modified cache is rejected before any crop or model call. Only the
+        # rejected hash/metadata is returned; the foreign image and any text
+        # are never copied into this audit.
+        fresh = (
+            isinstance(last, dict)
+            and last.get("audit_id") == provenance.get("audit_id")
+            and last.get("run_id") == provenance.get("run_id")
+            and last.get("frame_sha256") == image_sha256
+        )
+        if not fresh:
+            rejection = _failure(
+                "audit_capture_required",
+                "OCR under audit needs a fresh screen() capture of the active "
+                "audit; the cached frame predates activation, belongs to "
+                "another audit, or changed on disk",
+                retryable=False,
+            )
+            rejection["frame_sha256"] = image_sha256
+            rejection["cache_audit_id"] = (
+                last.get("audit_id") if isinstance(last, dict) else None
+            )
+            rejection["cache_run_id"] = (
+                last.get("run_id") if isinstance(last, dict) else None
+            )
+            return rejection
 
     effective_scope = scope
     used_bbox: dict[str, int] | None = None
     if scope == "diff":
-        diff = capture.last_diff()
+        diff = last_diff
         if not diff.get("baseline") and not diff.get("changed"):
             # Nothing changed since the previous capture: there is nothing
             # new to read, and guessing from the whole frame would answer a
-            # question the caller did not ask.
-            return {
+            # question the caller did not ask. No text, no crop and no
+            # model call are invented for it.
+            unchanged_result: dict[str, Any] = {
                 "ok": True,
                 "changed": False,
                 "text": "",
                 "scope": "diff",
                 "bbox_px": None,
             }
+            if provenance is not None and isinstance(last, dict):
+                # Provenance is attached without changing any existing field.
+                unchanged_result["source_evidence_id"] = last.get("evidence_id")
+                unchanged_result["frame_sha256"] = image_sha256
+            return unchanged_result
         box = diff.get("bbox_px") if diff.get("changed") else None
         if not isinstance(box, dict):
             # No baseline frame yet: the only honest region is the whole frame.
@@ -247,10 +312,37 @@ def run_ocr(
             f"the OCR endpoint returned an unusable chat completion: {exc}",
             retryable=True,
         )
-    return {
+    result = {
         "ok": True,
         "text": text,
         "scope": effective_scope,
         "bbox_px": used_bbox,
         "model": config.ocr_model,
     }
+    if provenance is not None and audit_sink is not None:
+        # The provenance comes from the pre-model snapshot: a capture that
+        # completed while the model was thinking must not rebind this OCR
+        # result to another frame. ``image`` is the exact PNG sent to the
+        # endpoint (possibly a crop) and ``image_sha256`` the full frame it
+        # was taken from.
+        source_id = last.get("evidence_id") if isinstance(last, dict) else None
+        try:
+            audit_sink.manager.record_ocr(
+                audit_sink.titella_id,
+                source_evidence_id=source_id,
+                frame_sha256=image_sha256,
+                image_bytes=image,
+                text=text,
+                scope=effective_scope,
+                bbox=used_bbox,
+                model=config.ocr_model,
+            )
+        except BaseException:
+            # The model already produced a real answer; a failed archive
+            # faults its own audit and never turns the OCR result into an
+            # error or an invented text.
+            pass
+        # Provenance added without changing any existing field.
+        result["source_evidence_id"] = source_id
+        result["frame_sha256"] = image_sha256
+    return result

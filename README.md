@@ -64,6 +64,7 @@ Precedence: `--config` > environment variables > `~/.config/titella/config.toml`
 | `TITELLA_OCR_API_KEY` | unset | Bearer token for the OCR endpoint; reported only as `ocr_api_key_configured` |
 | `TITELLA_OCR_TIMEOUT_S` | `30` | Per-request OCR timeout |
 | `TITELLA_STATE_DIR` | system temp | Lease, resolution, frames and `link_id` |
+| `TITELLA_AUDIT_ROOT` | `~/.local/state/titella/audits` | Global persistent evidence root; independent of temporary operational state |
 | `TITELLA_WINDOW_HELPER` | system temp | Absolute path of the compiled macOS window helper; pin it so a one-off Accessibility grant survives restarts and temp cleanups |
 | `TITELLA_KEYBOARD_LAYOUT` | `es_ES` | HID layout preference reported in `titella_list` (`es_ES` or `en_US`); `slave_bootstrap` never uses it as a fallback |
 | `TITELLA_SLAVE_PLATFORM` | unset | Slave platform: `macos`, `linux` or `windows`. It is never inferred from the master |
@@ -82,6 +83,7 @@ TOML example (single or multi-titella via `[titella.<id>]`):
 ```toml
 state_dir = "~/.local/state/titella"
 http_port = 8765
+audit_root = "~/.local/state/titella/audits"
 default_titella = "omarchy"
 
 [titella.omarchy]
@@ -119,6 +121,17 @@ window_app = "Citrix Viewer"
 window_title = "remote session"
 keyboard_layout = "es_ES"
 ```
+
+### Audit evidence
+
+Recording is opt-in per instance: call `audit_activate`, then `audit_status`.
+Private archives retain original inputs, complete output streams, PNGs and OCR
+provenance. They may contain credentials and personal data; exports select evidence
+explicitly and perform no automatic redaction. A recording fault blocks new audited
+actions but not safety cleanup. Interrupted runs require an explicit resume or
+deactivation. Read the served `work-protocol`, `audit-mode` and `audit-report-skill`
+documents with `docs_read` before use; offline search, read, notes and exports need no
+slave connection.
 
 ### Window transport
 

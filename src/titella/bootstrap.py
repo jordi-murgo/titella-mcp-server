@@ -26,7 +26,7 @@ import secrets
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from titella_slave_assets.bundles import BundleError, load_bundle
@@ -109,6 +109,28 @@ class PlatformProfile:
     hello_wait_s: float
 
 
+# Implementations a Windows slave may run. The platform profile carries the
+# default; an instance can select another one explicitly. Every name here must
+# exist in the slave-assets manifest, and each of them carries the same wire
+# protocol, channels and error vocabulary.
+# Implementations whose loader opens the HID binding instead of a CDC device.
+HID_IMPLEMENTATIONS = frozenset(
+    ("windows-dotnet", "windows-dotnet-dll", "windows-python"))
+
+
+def is_hid_implementation(implementation: str) -> bool:
+    return implementation in HID_IMPLEMENTATIONS
+
+
+# The two .NET variants share the C# source, the loader template and the HID
+# bootstrap; only the loader's compile mode differs, so they are named apart
+# and `auto` keeps the executable one.
+WINDOWS_IMPLEMENTATIONS: dict[str, str] = {
+    "windows-dotnet": "windows-dotnet",
+    "windows-dotnet-dll": "windows-dotnet-dll",
+    "windows-python": "windows-python",
+}
+
 PLATFORM_PROFILES: dict[str, PlatformProfile] = {
     "macos": PlatformProfile(
         implementation="python",
@@ -140,6 +162,27 @@ PLATFORM_PROFILES: dict[str, PlatformProfile] = {
 }
 
 
+def resolve_profile(platform: str, implementation: str = "auto") -> PlatformProfile:
+    """The profile for one attempt, with the selected implementation applied.
+
+    ``auto`` keeps the per-platform default, so an existing configuration
+    behaves exactly as before. An explicit Windows implementation replaces
+    only the payload: the launcher, the waits and the transport rules are
+    properties of the platform, not of the agent runtime.
+    """
+    profile = PLATFORM_PROFILES[platform]
+    if implementation in (None, "", "auto"):
+        return profile
+    if platform != "windows":
+        raise ValueError(
+            f"implementation {implementation!r} is only selectable on windows")
+    if implementation not in WINDOWS_IMPLEMENTATIONS:
+        raise ValueError(
+            f"unknown windows implementation {implementation!r}; expected "
+            + ", ".join(sorted(WINDOWS_IMPLEMENTATIONS)))
+    return replace(profile, implementation=WINDOWS_IMPLEMENTATIONS[implementation])
+
+
 def _check_identifier(kind: str, value: str) -> str:
     if not _LINK_ID_RE.match(value):
         raise ValueError(f"{kind} must be 32 lowercase hexadecimal characters")
@@ -168,8 +211,12 @@ def _render_loader(bundle_source: str, implementation: str, link_id: str,
     _check_identifier("session_id", session_id)
     port = str(cdc_port).strip() if cdc_port is not None else ""
     if port.startswith("HID:"):
-        if implementation != "windows-dotnet":
-            raise ValueError("the HID binding requires the windows-dotnet loader")
+        # Every Windows implementation ships its own HID loader; a POSIX one
+        # has no HID transport at all and must never be rendered with a
+        # binding it cannot open.
+        if not is_hid_implementation(implementation):
+            raise ValueError(
+                f"the HID binding requires a windows implementation, got {implementation!r}")
         if not _HID_BINDING_RE.match(port):
             raise ValueError(
                 "the HID binding must be HID:<12 uppercase hexadecimal characters>"
@@ -183,12 +230,28 @@ def _render_loader(bundle_source: str, implementation: str, link_id: str,
             raise ValueError("hid_transport_source must be a non-empty string")
         if bundle_source.count(_HID_CONTAINER_MARKER) != 0:
             raise ValueError("the loader template must not carry the container marker")
-    if bundle_source.count("__HID_TRANSPORT_SOURCE_B64__") != 1 and "HID" in port:
-        raise ValueError("the loader template must carry exactly one HID transport placeholder")
-    if implementation == "python":
-        port_literal = repr(port) if port else "None"
-    else:
+    # Only the C# path ever embedded the transport as Base64 script text; the
+    # Python loader imports the staged module instead and carries no such
+    # placeholder. The contract stays exact for the template that has it.
+    if implementation in ("windows-dotnet", "windows-dotnet-dll"):
+        if bundle_source.count("__HID_TRANSPORT_SOURCE_B64__") != 1:
+            raise ValueError(
+                "the loader template must carry exactly one HID transport placeholder")
+        # The compile mode is a property of the selected implementation: both
+        # .NET variants ship the same template, so exactly one placeholder
+        # must be present and it is rendered from this selection alone.
+        if bundle_source.count("__AGENT_FORMAT__") != 1:
+            raise ValueError(
+                "the loader template must carry exactly one agent format placeholder")
+        agent_format = "dll" if implementation == "windows-dotnet-dll" else "exe"
+        bundle_source = bundle_source.replace("__AGENT_FORMAT__", agent_format)
+    # The binding is an internal ``HID:<serial>`` sentinel. Each runtime
+    # renders it in its own literal syntax: the Python loaders take a Python
+    # string, the PowerShell one doubles single quotes.
+    if implementation in ("windows-dotnet", "windows-dotnet-dll"):
         port_literal = port.replace("'", "''")
+    else:
+        port_literal = repr(port) if port else "None"
     return (
         bundle_source
         .replace("__LINK_ID__", link_id)
@@ -357,22 +420,14 @@ def windows_clipboard_stub_command(link_id: str) -> str:
     )
 
 
-def windows_hid_stage0_command(stage0_source: str, token: str, size: int,
-                               sha256: str) -> str:
-    """One console line that runs the USB-only stage-0 microloader.
+def windows_hid_stage0_input(stage0_source: str, token: str, size: int,
+                             sha256: str) -> tuple[str, str]:
+    """Return a short launcher and the stage-0 Base64 line read from stdin.
 
-    This line is the ONLY text a HID bootstrap types. It embeds the rendered
-    stage-0 template gzip+base64 and executes it in the current console: no
-    child process, no clipboard, no CDC, no network, no staged file. The
-    stage-0 loader pulls the #@# container (rendered loader, marker,
-    transport unit) out of the firmware Feature 0x11 snapshot, validates the
-    declared token, size and SHA-256, compiles the transport unit from a
-    temporary file and only then runs the loader part.
-
-    Exactly the three values are substituted; the whole serialized line stays
-    ASCII and free of the `es_ES` dead keys (backtick, circumflex, tilde), and
-    the bootstrap flow enforces the 3328-character budget (26.6 s of pacing)
-    before publishing the snapshot or typing.
+    The stage-0 script pulls the verified loader and transport container from
+    the Feature 0x11 snapshot. Both input lines must be typable on es_ES; the
+    caller checks their combined keystroke budget before staging the snapshot.
+    Console input can still be echoed or recorded by other Windows facilities.
     """
     if not isinstance(stage0_source, str) or not stage0_source:
         raise ValueError("stage0_source must be a non-empty string")
@@ -392,32 +447,37 @@ def windows_hid_stage0_command(stage0_source: str, token: str, size: int,
         .replace("__HID_SHA256__", sha256.lower())
     )
     encoded = base64.b64encode(gzip.compress(rendered.encode("utf-8"), mtime=0)).decode("ascii")
-    line = (
-        "$b='" + encoded + "';"
-        "$m=[IO.MemoryStream]::new([Convert]::FromBase64String($b));"
+    launcher = (
+        "$m=[IO.MemoryStream]::new([Convert]::FromBase64String([Console]::ReadLine()));"
         "$r=[IO.StreamReader]::new([IO.Compression.GzipStream]::new($m,([IO.Compression.CompressionMode]0)));"
         "iex $r.ReadToEnd()"
     )
-    if not line.isascii():
-        raise ValueError("the stage-0 line must be ASCII to survive the HID layout")
-    for banned in ("`", "^", "~", "\n", "\r"):
-        if banned in line:
-            raise ValueError(f"the stage-0 line must be typable on es_ES, found {banned!r}")
-    return line
+    for line in (launcher, encoded):
+        if not line.isascii():
+            raise ValueError("the stage-0 input must be ASCII to survive the HID layout")
+        for banned in ("`", "^", "~", "\n", "\r"):
+            if banned in line:
+                raise ValueError(f"the stage-0 input must be typable on es_ES, found {banned!r}")
+    return launcher, encoded
 
 
 def windows_loader_blob(link_id: str, session_id: str,
                         cdc_port: str | None = None, *,
-                        hid_transport_source: str | None = None) -> str:
+                        hid_transport_source: str | None = None,
+                        implementation: str = "windows-dotnet") -> str:
     """The gzip+base64 loader streamed to the Windows stub over the CDC.
 
     The HID snapshot is NOT these bytes: it is the `_hid_container` blob
     (loader, marker, transport unit) compressed by the bootstrap flow, so
     passing a HID binding here is rejected by `_render_loader`'s coupling
     unless a source is supplied — and even then the unit is never embedded
-    in the loader anymore."""
+    in the loader anymore.
+
+    `implementation` selects the compile mode the loader will render
+    (`windows-dotnet` or `windows-dotnet-dll`); both share this template.
+    """
     rendered = loader_source(link_id, session_id, cdc_port,
-                             implementation="windows-dotnet",
+                             implementation=implementation,
                              hid_transport_source=hid_transport_source)
     return base64.b64encode(gzip.compress(rendered.encode("utf-8"), mtime=0)).decode("ascii")
 
@@ -534,7 +594,8 @@ def loader_command(link_id: str, session_id: str, cdc_port: str | None = None) -
 
 def windows_loader_lines(link_id: str, session_id: str,
                          cdc_port: str | None = None, *,
-                         hid_transport_source: str | None = None) -> list[str]:
+                         hid_transport_source: str | None = None,
+                         implementation: str = "windows-dotnet") -> list[str]:
     """Console lines that accumulate and execute the PowerShell loader.
 
     The readable template is compressed with GZip before Base64 transport so
@@ -542,7 +603,7 @@ def windows_loader_lines(link_id: str, session_id: str,
     CDC; compression is transport, not a second editable implementation.
     """
     return _windows_lines(
-        loader_source(link_id, session_id, cdc_port, implementation="windows-dotnet",
+        loader_source(link_id, session_id, cdc_port, implementation=implementation,
                       hid_transport_source=hid_transport_source)
     )
 
@@ -640,7 +701,11 @@ class BootstrapManager:
                 "this attempt, then pass layout_confirmed=true",
             )
         selected_layout = layout
-        profile = PLATFORM_PROFILES[selected_platform]
+        try:
+            profile = resolve_profile(
+                selected_platform, getattr(self.config, "slave_implementation", "auto"))
+        except ValueError as exc:
+            return self._rejected("invalid_argument", str(exc))
         # The ESP32→slave leg is a configuration selection, never an argument:
         # the tool keeps its public signature and the operator switches it with
         # titella_upsert. HID carries the whole loader through the firmware
@@ -899,9 +964,9 @@ class BootstrapManager:
                 staged_source = rendered
             compressed = gzip.compress(staged_source.encode("utf-8"), mtime=0)
             blob = base64.b64encode(compressed).decode("ascii")
-            stage0_command: str | None = None
+            stage0_command = stage0_payload = ""
             if slave_transport == "hid":
-                # Everything the stage-0 line and the snapshot need is settled
+                # Everything the stage-0 input and snapshot need is settled
                 # before the slot is published or a key is typed: an oversized
                 # payload must fail as a named error, never as a timeout after
                 # publishing a half-usable snapshot.
@@ -922,14 +987,15 @@ class BootstrapManager:
                         session_id=session_id,
                     )
                 stage_token = secrets.token_hex(8)
-                stage0_command = windows_hid_stage0_command(
+                stage0_command, stage0_payload = windows_hid_stage0_input(
                     stage0_source, stage_token, len(compressed),
                     hashlib.sha256(compressed).hexdigest(),
                 )
-                if len(stage0_command) > _HID_STAGE0_MAX_CHARS:
+                typed_chars = len(stage0_command) + len(stage0_payload) + 2
+                if typed_chars > _HID_STAGE0_MAX_CHARS:
                     raise TransportError(
                         "hid_stage0_too_large",
-                        f"the typed stage-0 line is {len(stage0_command)} characters; "
+                        f"the typed stage-0 input is {typed_chars} characters; "
                         f"the keystroke budget is {_HID_STAGE0_MAX_CHARS}",
                         False,
                         session_id=session_id,
@@ -968,20 +1034,19 @@ class BootstrapManager:
                 )
 
             if slave_transport == "hid":
-                # Events are already subscribed: publish the snapshot over the
-                # UART first, and only then type the single stage-0 line. The
-                # console is the one the operator prepared, so nothing is
-                # launched or focused here.
+                # Publish the snapshot before typing the launcher and its
+                # separate stdin line into the operator-prepared console.
                 stage_started = time.monotonic()
                 self._stage_hid_snapshot(stage_token, compressed)
                 self._set(status="stage0_typed",
                           stage_elapsed_s=round(time.monotonic() - stage_started, 3))
-                for position in range(0, len(stage0_command), _HID_CHUNK_CHARS):
-                    self.hid.type_text(
-                        owner, stage0_command[position:position + _HID_CHUNK_CHARS],
-                        _WINDOWS_TYPE_DELAY_MS,
-                    )
-                self.hid.key(owner, "ENTER", [])
+                for line in (stage0_command, stage0_payload):
+                    for position in range(0, len(line), _HID_CHUNK_CHARS):
+                        self.hid.type_text(
+                            owner, line[position:position + _HID_CHUNK_CHARS],
+                            _WINDOWS_TYPE_DELAY_MS,
+                        )
+                    self.hid.key(owner, "ENTER", [])
                 self._set(status="waiting_loader")
                 with self._clipboard_hold():
                     loader_ready.wait(profile.loader_wait_s)
@@ -996,7 +1061,7 @@ class BootstrapManager:
                     raise TransportError(
                         "bootstrap_loader_timeout",
                         "the stage-0 microloader did not run the loader: check that the "
-                        f"prepared console received the typed line on the {hid_binding} "
+                        f"prepared console received both input lines on the {hid_binding} "
                         "HID binding, that its active keyboard layout matches, and that "
                         "PowerShell 5.1 with FullLanguage is allowed",
                         True,

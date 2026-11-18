@@ -7,6 +7,7 @@ import os
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,15 @@ class ScreenCapture:
         # Source of the last successful capture ("agent" or the UVC device),
         # so measure_diff repeats the same path.
         self.last_source: str | None = None
+        # Optional audit sink (set by TitellaInstance.attach_audit). Without
+        # an active audit it does no hashing, copying or extra work.
+        self.evidence_sink: Any | None = None
+        self._last_evidence: dict[str, Any] | None = None
+        self._capture_lock = threading.Lock()
+        # Incremented under _capture_lock on every successful cache write, so
+        # a capture that archives outside the lock can tell whether the cache
+        # still holds its own frame before publishing _last_evidence.
+        self._cache_generation = 0
 
     def resolution(self) -> tuple[int, int] | None:
         try:
@@ -139,79 +149,150 @@ class ScreenCapture:
         ``decoded`` carries a pre-decoded RGB buffer of ``image`` when the
         caller already had to decode it (the UVC auto-crop path).
         """
-        resolution = resolution or png_resolution(image)
-        if resolution is None or png_resolution(image) != resolution:
-            return _failure(
-                "invalid_screen_capture",
-                f"the {source} capture is not a valid PNG",
-                retryable=True,
-            ), None
+        # The cache snapshot is taken under one lock acquisition: the outgoing
+        # frame read, the diff, the .last_frame.png/.prev_frame.png replacement,
+        # the resolution and diff sidecars. A concurrent capture or an
+        # OCR/diff reader therefore never pairs one frame's bytes with another
+        # frame's provenance or bbox. The durable sink call (which waits for a
+        # write barrier) runs outside the lock, never under it.
+        sink = self.evidence_sink
+        with self._capture_lock:
+            resolution = resolution or png_resolution(image)
+            if resolution is None or png_resolution(image) != resolution:
+                # An invalid PNG is never archived as evidence success.
+                return _failure(
+                    "invalid_screen_capture",
+                    f"the {source} capture is not a valid PNG",
+                    retryable=True,
+                ), None
+            provenance = sink.current_provenance() if sink is not None else None
+            if provenance is not None:
+                # A header-shaped but corrupt PNG must never be archived as a
+                # successful capture: under an active audit the whole stream is
+                # decoded (or its already-decoded buffer reused) before any
+                # cache write or evidence record. Inactive captures keep their
+                # existing header-only validation and semantics.
+                valid = decoded
+                if valid is not None and (valid[0], valid[1]) != resolution:
+                    valid = None
+                if valid is None:
+                    valid = self._decode_frame(image)
+                if valid is None:
+                    return _failure(
+                        "invalid_screen_capture",
+                        f"the {source} capture is not a decodable PNG",
+                        retryable=True,
+                    ), None
 
-        previous_bytes: bytes | None = None
-        if self.last_frame_path.is_file():
-            try:
-                previous_bytes = self.last_frame_path.read_bytes()
-            except OSError:
-                previous_bytes = None
-        frame_sha256 = hashlib.sha256(image).hexdigest()
-        unchanged = previous_bytes is not None and previous_bytes == image
-        diff_info = self._diff_against_previous(
-            previous_bytes, image, resolution, unchanged, decoded
-        )
-
-        temporary_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                dir=self.config.state_dir,
-                prefix=".frame-",
-                suffix=".png",
-                delete=False,
-            ) as temporary:
-                temporary.write(image)
-                temporary_path = Path(temporary.name)
-            if previous_bytes is not None:
-                self._persist_previous_frame(previous_bytes)
-            os.replace(temporary_path, self.last_frame_path)
-            resolution_state: dict[str, Any] = {"w": resolution[0], "h": resolution[1]}
-            # The raw frame size and the crop box let a window link map a HID
-            # coordinate back onto the exact window pixel even when autocrop
-            # removed borders, and let it scale a Retina capture onto points.
-            if raw_resolution is not None:
-                resolution_state["raw_w"] = raw_resolution[0]
-                resolution_state["raw_h"] = raw_resolution[1]
-            if crop_box is not None:
-                resolution_state["crop_box"] = dict(crop_box)
-            self.resolution_path.write_text(
-                json.dumps(resolution_state), encoding="utf-8"
+            previous_bytes: bytes | None = None
+            if self.last_frame_path.is_file():
+                try:
+                    previous_bytes = self.last_frame_path.read_bytes()
+                except OSError:
+                    previous_bytes = None
+            frame_sha256 = hashlib.sha256(image).hexdigest()
+            unchanged = previous_bytes is not None and previous_bytes == image
+            diff_info = self._diff_against_previous(
+                previous_bytes, image, resolution, unchanged, decoded
             )
-        except OSError as exc:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
-            return _failure(
-                "screen_state_failed",
-                f"the capture cannot be saved: {exc}",
-                retryable=False,
-            ), None
-        metadata: dict[str, object] = {
-            "ok": True,
-            "path": str(self.last_frame_path),
-            "source": source,
-            "capture_resolution": {"width_px": resolution[0], "height_px": resolution[1]},
-            "frame_sha256": frame_sha256,
-            "unchanged_since_previous": unchanged,
-            "diff": diff_info,
-        }
-        if raw_resolution is not None:
-            metadata["raw_resolution"] = {
-                "width_px": raw_resolution[0],
-                "height_px": raw_resolution[1],
+
+            temporary_path: Path | None = None
+            cache_saved = False
+            cache_failure: dict[str, object] | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=self.config.state_dir,
+                    prefix=".frame-",
+                    suffix=".png",
+                    delete=False,
+                ) as temporary:
+                    temporary.write(image)
+                    temporary_path = Path(temporary.name)
+                if previous_bytes is not None:
+                    self._persist_previous_frame(previous_bytes)
+                os.replace(temporary_path, self.last_frame_path)
+                # The cache content changed at this point even if a sidecar
+                # write below fails; the generation tracks the cached bytes.
+                self._cache_generation += 1
+                resolution_state: dict[str, Any] = {"w": resolution[0], "h": resolution[1]}
+                # The raw frame size and the crop box let a window link map a HID
+                # coordinate back onto the exact window pixel even when autocrop
+                # removed borders, and let it scale a Retina capture onto points.
+                if raw_resolution is not None:
+                    resolution_state["raw_w"] = raw_resolution[0]
+                    resolution_state["raw_h"] = raw_resolution[1]
+                if crop_box is not None:
+                    resolution_state["crop_box"] = dict(crop_box)
+                self.resolution_path.write_text(
+                    json.dumps(resolution_state), encoding="utf-8"
+                )
+                cache_saved = True
+            except OSError as exc:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+                cache_failure = _failure(
+                    "screen_state_failed",
+                    f"the capture cannot be saved: {exc}",
+                    retryable=False,
+                )
+                # The archive of the valid PNG is marked as not cached, and the
+                # caller receives the original operational error unchanged.
+                cache_failure["cache_saved"] = False
+            else:
+                # The sidecars describe the frame that is now cached; writing
+                # them after a failed cache write would pair them with the
+                # frame that is still on disk.
+                self._persist_diff_state(frame_sha256, unchanged, diff_info, source)
+                self.last_source = source
+
+            metadata: dict[str, object] = {
+                "ok": True,
+                "path": str(self.last_frame_path),
+                "source": source,
+                "capture_resolution": {"width_px": resolution[0], "height_px": resolution[1]},
+                "frame_sha256": frame_sha256,
+                "unchanged_since_previous": unchanged,
+                "diff": diff_info,
             }
-        if crop_box is not None:
-            metadata["crop_box"] = dict(crop_box)
-        if monitor is not None:
-            metadata["monitor"] = monitor
-        self._persist_diff_state(frame_sha256, unchanged, diff_info, source)
-        self.last_source = source
+            if raw_resolution is not None:
+                metadata["raw_resolution"] = {
+                    "width_px": raw_resolution[0],
+                    "height_px": raw_resolution[1],
+                }
+            if crop_box is not None:
+                metadata["crop_box"] = dict(crop_box)
+            if monitor is not None:
+                metadata["monitor"] = monitor
+            generation = self._cache_generation
+            provenance = sink.current_provenance() if sink is not None else None
+            if provenance is None:
+                # Sink attached but no active audit (or unhealthy binding):
+                # inactive semantics, and no stale reference survives for a
+                # later activation to trust. No extra hashing or copying.
+                self._last_evidence = None
+                if cache_failure is not None:
+                    return cache_failure, None
+                return metadata, image
+
+        # Outside the lock: the sink is a durable barrier and must never hold
+        # the capture lock while it waits for its write. The valid PNG is
+        # archived whether or not this cache write succeeded (cache_saved=false).
+        # The sink faults its own manager on failure and returns None; the
+        # operational result of the capture is never reinterpreted here.
+        record_metadata = dict(metadata)
+        record_metadata["cache_saved"] = cache_saved
+        evidence = sink.record(image, record_metadata, source=source)
+        with self._capture_lock:
+            if cache_saved and self._cache_generation == generation:
+                # No later capture has claimed the cache in the meantime:
+                # this record owns it. A None sink result (inactive or
+                # faulted) leaves no reference for this cache content.
+                self._last_evidence = evidence
+            # On a failed cache write the cache still holds the previous
+            # frame, whose existing reference stays accurate and is left
+            # untouched; a later capture owns its own reference.
+        if cache_failure is not None:
+            return cache_failure, None
         return metadata, image
 
     def _persist_previous_frame(self, previous_bytes: bytes) -> None:
@@ -363,12 +444,62 @@ class ScreenCapture:
                 "run screen first to capture a baseline frame",
                 retryable=False,
             ), None
-        diff = self.last_diff()
+        sink = self.evidence_sink
+        # One snapshot under the capture lock: the cached frame bytes, the
+        # diff envelope and the auditable reference must all describe the
+        # same frame, or a concurrent capture could pair one frame's bytes
+        # with another frame's bbox and provenance.
+        with self._capture_lock:
+            try:
+                frame_bytes = self.last_frame_path.read_bytes()
+            except OSError as exc:
+                return _failure(
+                    "screen_state_failed",
+                    f"the last frame cannot be read: {exc}",
+                    retryable=True,
+                ), None
+            last = self._last_evidence
+            diff = self.last_diff()
+            provenance = sink.current_provenance() if sink is not None else None
+            # No hash is computed while the audit is inactive: provenance work
+            # only exists under an active audit.
+            current_sha = (
+                hashlib.sha256(frame_bytes).hexdigest()
+                if provenance is not None
+                else ""
+            )
+        if provenance is not None:
+            # Under an active audit the crop may only derive from a capture
+            # archived in the same audit and run whose bytes are still the
+            # cached ones. The rejection carries only hash/metadata; the
+            # foreign image is never copied into this audit.
+            fresh = (
+                isinstance(last, dict)
+                and last.get("audit_id") == provenance.get("audit_id")
+                and last.get("run_id") == provenance.get("run_id")
+                and last.get("frame_sha256") == current_sha
+            )
+            if not fresh:
+                rejection = _failure(
+                    "audit_capture_required",
+                    "screen_diff under audit needs a fresh screen() capture "
+                    "of the active audit; the cached frame predates "
+                    "activation, belongs to another audit, or changed on disk",
+                    retryable=False,
+                )
+                rejection["frame_sha256"] = current_sha
+                rejection["cache_audit_id"] = (
+                    last.get("audit_id") if isinstance(last, dict) else None
+                )
+                rejection["cache_run_id"] = (
+                    last.get("run_id") if isinstance(last, dict) else None
+                )
+                return rejection, None
         bbox = diff.get("bbox_px")
         if not diff.get("changed") or not isinstance(bbox, dict):
             return {"ok": True, "changed": False, "bbox_px": None, "diff": diff}, None
         try:
-            width, height, rgb = decode_png(self.last_frame_path.read_bytes())
+            width, height, rgb = decode_png(frame_bytes)
         except (OSError, ValueError) as exc:
             return _failure(
                 "screen_state_failed",
@@ -387,14 +518,33 @@ class ScreenCapture:
                 retryable=False,
             ), None
         cropped = crop_rgb(width, height, rgb, left, top, right - left, bottom - top)
-        return {
+        crop_png = encode_png_rgb(right - left, bottom - top, cropped)
+        metadata = {
             "ok": True,
             "changed": True,
             "bbox_px": {"x": left, "y": top, "width": right - left, "height": bottom - top},
             "raw_bbox_px": dict(bbox),
             "full_resolution": {"width_px": width, "height_px": height},
             "diff": diff,
-        }, encode_png_rgb(right - left, bottom - top, cropped)
+        }
+        if sink is not None and provenance is not None:
+            # The crop is derived from the archived frame, not a new capture:
+            # it references the frame evidence id seen in this snapshot and
+            # records the full frame's hash, exactly like the source capture.
+            # The sink is a durable barrier and is called outside the capture
+            # lock; its failure never turns this real crop into an error.
+            source_id = last.get("evidence_id") if isinstance(last, dict) else None
+            record_metadata = dict(metadata)
+            record_metadata["frame_sha256"] = current_sha
+            record_metadata["source_evidence_id"] = source_id
+            sink.record(
+                crop_png,
+                record_metadata,
+                source="diff",
+                role="diff",
+                related=[source_id] if source_id else None,
+            )
+        return metadata, crop_png
 
     def _window(self) -> tuple[dict, bytes | None]:
         """One PNG of the configured macOS window, with the UVC autocrop rules."""

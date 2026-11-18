@@ -18,7 +18,7 @@ from titella.bootstrap import (
     _hid_container,
     _render_loader,
     loader_source,
-    windows_hid_stage0_command,
+    windows_hid_stage0_input,
 )
 from titella_slave_assets.bundles import load_bundle
 from titella_slave_assets.wire import (
@@ -36,7 +36,8 @@ SESSION = "b" * 32
 # Inline fixture: the M suite must never read the slave checkout, and the
 # staged snapshot template lives there until the bundle carries it.
 STAGE0 = "$tok = '__HID_TOKEN__'\n$size = __HID_SIZE__\n$sha = '__HID_SHA256__'\n"
-WINDOWS_TEMPLATE = "P='__CDC_PORT__'\nH='__HID_TRANSPORT_SOURCE_B64__'\n"
+WINDOWS_TEMPLATE = ("P='__CDC_PORT__'\nF='__AGENT_FORMAT__'\n"
+                   "H='__HID_TRANSPORT_SOURCE_B64__'\n")
 UNIT = "namespace Titella.Slave {\n  public sealed class HidByteStream { }\n}\n"
 BINDING = "HID:012345ABCDEF"
 
@@ -58,13 +59,27 @@ class HidStage0CommandTests(unittest.TestCase):
         for source, token, size, digest in cases:
             with self.subTest(token=token, size=size, digest=digest[:8]):
                 with self.assertRaises(ValueError):
-                    windows_hid_stage0_command(source, token, size, digest)
+                    windows_hid_stage0_input(source, token, size, digest)
 
     def test_rejects_a_template_missing_one_placeholder(self) -> None:
         partial = STAGE0.replace("__HID_SHA256__", "fixed")
         with self.assertRaises(ValueError):
-            windows_hid_stage0_command(partial, "0123456789abcdef", 10,
-                                       hashlib.sha256(b"x").hexdigest())
+            windows_hid_stage0_input(partial, "0123456789abcdef", 10,
+                                     hashlib.sha256(b"x").hexdigest())
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell is not installed")
+    def test_launcher_reads_and_executes_the_separate_input_line(self) -> None:
+        source = STAGE0 + "[Console]::WriteLine('RESULT:' + $tok + ':' + $size + ':' + $sha)\n"
+        digest = hashlib.sha256(b"loader").hexdigest()
+        command, payload = windows_hid_stage0_input(source, "0123456789abcdef", 10, digest)
+        self.assertIn("[Console]::ReadLine()", command)
+        self.assertNotIn(payload, command)
+        result = subprocess.run(
+            [shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-Command", command],
+            input=payload + "\n", text=True, capture_output=True, timeout=30, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("RESULT:0123456789ABCDEF:10:" + digest, result.stdout)
 
 
 class HidRenderTests(unittest.TestCase):
@@ -72,7 +87,9 @@ class HidRenderTests(unittest.TestCase):
         cases = (
             ("windows-dotnet", BINDING, None, "requires hid_transport_source"),
             ("windows-dotnet", "COM5", UNIT, "requires the HID"),
-            ("python", BINDING, UNIT, "windows-dotnet loader"),
+            # Any non-Windows implementation has no HID transport at all, so
+            # a binding is refused for it by name rather than silently typed.
+            ("python", BINDING, UNIT, "requires a windows implementation"),
             ("windows-dotnet", "HID:012345abcdef", UNIT, "12 uppercase"),
             ("windows-dotnet", BINDING, "  ", "non-empty"),
         )
@@ -82,12 +99,64 @@ class HidRenderTests(unittest.TestCase):
                     _render_loader(WINDOWS_TEMPLATE, implementation, LINK, SESSION, port,
                                    hid_transport_source=source)
 
+    def test_each_windows_implementation_renders_its_own_literal(self) -> None:
+        """The binding is a Python string for the Python loaders and a
+        single-quoted PowerShell literal for the C# one."""
+        # Each template only needs a port slot; the C# one additionally owes
+        # the transport and agent-format placeholders its contract requires.
+        py = _render_loader("P=__CDC_PORT__", "windows-python", LINK, SESSION,
+                            BINDING, hid_transport_source=UNIT)
+        self.assertIn(repr(BINDING), py)
+        csharp_template = ("P='__CDC_PORT__'" + chr(10) + "F='__AGENT_FORMAT__'" + chr(10)
+                           + "$s='__HID_TRANSPORT_SOURCE_B64__'")
+        pwsh = _render_loader(csharp_template, "windows-dotnet", LINK, SESSION,
+                              BINDING, hid_transport_source=UNIT)
+        self.assertIn("'" + BINDING + "'", pwsh)
+        # ...and it is rendered empty: the unit travels behind the marker.
+        self.assertIn("$s=''", pwsh)
+
     def test_hid_source_is_rejected_when_the_template_carries_no_placeholder(self) -> None:
         with self.assertRaisesRegex(ValueError, "exactly one HID transport placeholder"):
             _render_loader(
                 "P='__CDC_PORT__'", "windows-dotnet", LINK, SESSION, BINDING,
                 hid_transport_source=UNIT,
             )
+
+    def test_each_dotnet_variant_renders_its_own_compile_mode(self) -> None:
+        """The same template yields exe or dll from the selection alone."""
+        template = ("P='__CDC_PORT__'\nF='__AGENT_FORMAT__'\n"
+                    "H='__HID_TRANSPORT_SOURCE_B64__'\n")
+        exe = _render_loader(template, "windows-dotnet", LINK, SESSION, BINDING,
+                             hid_transport_source=UNIT)
+        dll = _render_loader(template, "windows-dotnet-dll", LINK, SESSION, BINDING,
+                             hid_transport_source=UNIT)
+        self.assertIn("F='exe'", exe)
+        self.assertIn("F='dll'", dll)
+        self.assertNotIn("__AGENT_FORMAT__", exe + dll)
+        # Everything else is identical: the mode is the only difference.
+        self.assertEqual(exe.replace("F='exe'", "F='?'"),
+                         dll.replace("F='dll'", "F='?'"))
+
+    def test_agent_format_placeholder_is_required_exactly_once(self) -> None:
+        for template, message in (
+            ("P='__CDC_PORT__'\nH='__HID_TRANSPORT_SOURCE_B64__'\n",
+             "exactly one agent format placeholder"),
+            ("P='__CDC_PORT__'\nF='__AGENT_FORMAT__'\nF='__AGENT_FORMAT__'\n"
+             "H='__HID_TRANSPORT_SOURCE_B64__'\n",
+             "exactly one agent format placeholder"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    _render_loader(template, "windows-dotnet", LINK, SESSION, BINDING,
+                                   hid_transport_source=UNIT)
+
+    def test_python_loaders_are_not_given_the_agent_format(self) -> None:
+        """The placeholder belongs to the C# template only; a Python loader
+        that carried it would stay literally unrendered, which is a template
+        defect and must not be papered over here."""
+        rendered = _render_loader("P=__CDC_PORT__", "windows-python", LINK, SESSION,
+                                  BINDING, hid_transport_source=UNIT)
+        self.assertNotIn("__AGENT_FORMAT__", rendered)
 
     def test_hid_render_never_embeds_the_transport_unit(self) -> None:
         """Container mode: the placeholder is rendered empty and the unit

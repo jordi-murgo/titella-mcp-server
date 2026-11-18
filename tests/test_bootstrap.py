@@ -14,6 +14,7 @@ from pathlib import Path
 from titella.bootstrap import (
     PLATFORM_PROFILES,
     BootstrapManager,
+    resolve_profile,
     loader_command,
     loader_source,
     posix_loader_blob,
@@ -24,6 +25,11 @@ from titella.serial_link import TransportError
 from titella_slave_assets.bundles import load_bundle
 
 LINK = "0123456789abcdef0123456789abcdef"
+
+
+def _ungzip_stage0(encoded: str) -> str:
+    """Decodes the separate Base64 line supplied to the launcher."""
+    return gzip.decompress(base64.b64decode(encoded, validate=True)).decode("utf-8")
 
 
 class FakeLease:
@@ -43,6 +49,8 @@ class FakeHid:
         self.typed_delays: list[int] = []
         self.events: list[tuple[str, object, object]] = []
         self.on_enter = None
+        self.enter_count = 0
+        self.on_enter_after = 1
 
     def keyboard_layout(self, owner, layout):
         self.layouts.append((owner, layout))
@@ -52,8 +60,11 @@ class FakeHid:
         self.keys.append((owner, key, tuple(mods)))
         self.events.append(("key", key, tuple(mods)))
         if key == "ENTER" and self.on_enter:
-            callback, self.on_enter = self.on_enter, None
-            callback()
+            self.enter_count += 1
+            if self.enter_count == self.on_enter_after:
+                self.enter_count = 0
+                callback, self.on_enter = self.on_enter, None
+                callback()
         return {"ok": True}
 
     def type_text(self, owner, text, delay):
@@ -61,6 +72,16 @@ class FakeHid:
         self.typed_delays.append(delay)
         self.events.append(("type", text, delay))
         return {"ok": True}
+
+    def entered_lines(self):
+        lines, current = [], []
+        for kind, value, _ in self.events:
+            if kind == "type":
+                current.append(value)
+            elif kind == "key" and value == "ENTER":
+                lines.append("".join(current))
+                current = []
+        return lines
 
 
 class FakeLink:
@@ -892,6 +913,7 @@ class HidBootstrapTests(unittest.TestCase):
                     "session_id": manager.status()["session_id"],
                     "op": "loader.ready", "body": {"runtime": "stage0"},
                 })
+            hid.on_enter_after = 2
             hid.on_enter = ready_after_enter
 
             result = manager.bootstrap(
@@ -922,6 +944,84 @@ class HidBootstrapTests(unittest.TestCase):
             # The destination is selected before the layout is touched.
             self.assertEqual(
                 ops.index("slave_transport") < ops.index("loader_stage_begin"), True)
+            command, payload = hid.entered_lines()
+            self.assertIn("[Console]::ReadLine()", command)
+            self.assertNotIn(payload, command)
+            self.assertIn("Titella.HW", _ungzip_stage0(payload))
+
+    def test_hid_bootstrap_can_stage_the_dll_variant(self) -> None:
+        """The DLL selection stages the same payload with the dll compile mode."""
+        import gzip
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp, TITELLA_SLAVE_IMPLEMENTATION="windows-dotnet-dll")
+            link = FakeLink()
+            hid = FakeHid()
+            manager = BootstrapManager(config, link, hid)
+
+            def ready_after_enter():
+                link.emit({
+                    "v": 1, "channel": "bootstrap", "type": "event", "link_id": LINK,
+                    "session_id": manager.status()["session_id"],
+                    "op": "loader.ready", "body": {"runtime": "stage0"},
+                })
+            hid.on_enter_after = 2
+            hid.on_enter = ready_after_enter
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows",
+                layout_confirmed=True, skip_launch=True,
+            )
+            self.assertEqual(result["status"], "ready", result)
+            self.assertEqual(result["implementation"], "windows-dotnet-dll")
+            self.assertEqual(result["slave_transport"], "hid")
+            staged = gzip.decompress(bytes(link.staged_bytes)).decode("utf-8")
+            loader, _marker, transport = staged.partition("#@#")
+            self.assertIn("$script:Fmt = 'dll'", loader)
+            self.assertNotIn("__AGENT_FORMAT__", loader)
+            self.assertIn("namespace Titella.Slave", transport)
+            command, payload = hid.entered_lines()
+            self.assertIn("[Console]::ReadLine()", command)
+            self.assertIn("Titella.HW", _ungzip_stage0(payload))
+
+    def test_hid_bootstrap_can_stage_the_python_implementation(self) -> None:
+        """The selected implementation decides which payload is staged."""
+        with tempfile.TemporaryDirectory() as temp:
+            config = self._config(temp, TITELLA_SLAVE_IMPLEMENTATION="windows-python")
+            link = FakeLink()
+            hid = FakeHid()
+
+            def ready_after_enter():
+                link.emit({
+                    "v": 1, "channel": "bootstrap", "type": "event", "link_id": LINK,
+                    "session_id": manager.status()["session_id"],
+                    "op": "loader.ready", "body": {"runtime": "stage0"},
+                })
+            manager = BootstrapManager(config, link, hid)
+            hid.on_enter_after = 2
+            hid.on_enter = ready_after_enter
+            result = manager.bootstrap(
+                "operator", "es_ES", platform="windows",
+                layout_confirmed=True, skip_launch=True,
+            )
+            self.assertEqual(result["status"], "ready", result)
+            self.assertEqual(result["implementation"], "windows-python")
+            self.assertEqual(manager.status()["implementation"], "windows-python")
+            # The staged container carries this runtime's transport unit, and
+            # the typed stage-0 line is the Python one (it launches
+            # `python.exe`, never `csc.exe`).
+            import gzip
+            staged = gzip.decompress(bytes(link.staged_bytes)).decode("utf-8")
+            loader, _marker, transport = staged.partition("#@#")
+            # The container carries this runtime's transport unit, not the C#
+            # one: the unit after the marker is Python, and the loader imports
+            # it as a module instead of compiling it.
+            self.assertIn("import hid_transport", loader)
+            self.assertIn("class HidByteStream", transport)
+            self.assertIn("def open_stream", transport)
+            self.assertNotIn("namespace Titella.Slave", transport)
+            command, payload = hid.entered_lines()
+            self.assertIn("[Console]::ReadLine()", command)
+            self.assertIn("hid_transport.py", _ungzip_stage0(payload))
+            self.assertNotIn("csc.exe", command + payload)
 
     def test_hid_snapshot_container_carries_the_unit_behind_one_marker(self) -> None:
         """The staged blob is the #@# container: the transport unit travels
@@ -942,6 +1042,7 @@ class HidBootstrapTests(unittest.TestCase):
                     "session_id": manager.status()["session_id"],
                     "op": "loader.ready", "body": {"runtime": "stage0"},
                 })
+            hid.on_enter_after = 2
             hid.on_enter = ready_after_enter
 
             result = manager.bootstrap(
@@ -1113,6 +1214,7 @@ class HidBootstrapTests(unittest.TestCase):
                 return original_request(channel, op, body, timeout)
 
             link.request = delayed_close  # type: ignore[assignment]
+            hid.on_enter_after = 2
             hid.on_enter = lambda: link.emit({
                 "v": 1, "channel": "bootstrap", "type": "event", "link_id": LINK,
                 "session_id": manager.status()["session_id"],
@@ -1185,6 +1287,7 @@ class HidBootstrapTests(unittest.TestCase):
 
             link.request = closes_after_two_probes  # type: ignore[assignment]
             link.requests.clear()
+            hid.on_enter_after = 2
             hid.on_enter = lambda: link.emit({
                 "v": 1, "channel": "bootstrap", "type": "event", "link_id": LINK,
                 "session_id": manager.status()["session_id"],
@@ -1330,6 +1433,65 @@ class HidBootstrapTests(unittest.TestCase):
             self.assertEqual(result["slave_transport"], "cdc")
             self.assertIsNone(result["hid_binding"])
             self.assertIsNone(manager.status()["hid_binding"])
+
+
+class ImplementationSelectionTests(unittest.TestCase):
+    """`slave_implementation` changes the payload, never the platform rules."""
+
+    def test_auto_keeps_the_platform_default(self) -> None:
+        profile = resolve_profile("windows", "auto")
+        self.assertEqual(profile.implementation, "windows-dotnet")
+        self.assertIs(resolve_profile("windows", None), PLATFORM_PROFILES["windows"])
+
+    def test_explicit_selection_swaps_only_the_payload(self) -> None:
+        default = PLATFORM_PROFILES["windows"]
+        selected = resolve_profile("windows", "windows-python")
+        self.assertEqual(selected.implementation, "windows-python")
+        # The launcher and the waits belong to the platform, not the runtime.
+        self.assertEqual(selected.launcher_mods, default.launcher_mods)
+        self.assertEqual(selected.launcher_text, default.launcher_text)
+        self.assertEqual(selected.hello_wait_s, default.hello_wait_s)
+        # And the module default is untouched for an instance that selects auto.
+        self.assertEqual(default.implementation, "windows-dotnet")
+
+    def test_unknown_or_non_windows_selection_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown windows implementation"):
+            resolve_profile("windows", "windows-arm")
+        with self.assertRaisesRegex(ValueError, "only selectable on windows"):
+            resolve_profile("linux", "windows-python")
+        with self.assertRaisesRegex(ValueError, "only selectable on windows"):
+            resolve_profile("linux", "windows-dotnet-dll")
+
+    def test_dll_variant_is_selectable_and_keeps_the_platform_rules(self) -> None:
+        default = PLATFORM_PROFILES["windows"]
+        selected = resolve_profile("windows", "windows-dotnet-dll")
+        self.assertEqual(selected.implementation, "windows-dotnet-dll")
+        self.assertEqual(selected.launcher_mods, default.launcher_mods)
+        self.assertEqual(selected.launcher_key, default.launcher_key)
+        self.assertEqual(selected.launcher_text, default.launcher_text)
+        self.assertEqual(selected.loader_wait_s, default.loader_wait_s)
+        self.assertEqual(selected.hello_wait_s, default.hello_wait_s)
+        # `auto` never drifts to the DLL variant.
+        self.assertEqual(default.implementation, "windows-dotnet")
+        self.assertEqual(resolve_profile("windows", "auto").implementation,
+                         "windows-dotnet")
+
+    def test_every_selectable_implementation_ships_a_bundle(self) -> None:
+        for platform in ("macos", "linux", "windows"):
+            profile = PLATFORM_PROFILES[platform]
+            self.assertIsNotNone(load_bundle(profile.implementation))
+        for implementation in ("windows-dotnet", "windows-dotnet-dll", "windows-python"):
+            bundle = load_bundle(implementation)
+            self.assertTrue(bundle.hid_stage0_source, implementation)
+            self.assertTrue(bundle.hid_transport_source, implementation)
+        # The two .NET names resolve to one payload and one loader source; the
+        # render alone decides the compile mode.
+        exe = load_bundle("windows-dotnet")
+        dll = load_bundle("windows-dotnet-dll")
+        self.assertEqual(exe.payload, dll.payload)
+        self.assertEqual(exe.sha256, dll.sha256)
+        self.assertEqual(exe.loader_source, dll.loader_source)
+        self.assertEqual(exe.filename, dll.filename)
 
 
 if __name__ == "__main__":

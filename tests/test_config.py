@@ -211,6 +211,54 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.agent_protocol, "serial")
         self.assertIsNone(config.slave_cdc_port)
 
+    def test_slave_implementation_defaults_to_auto_and_is_selectable(self) -> None:
+        # An explicit path keeps the operator's own config.toml out of the
+        # test: passing environ replaces the environment, so without it the
+        # defaults file would be found on disk.
+        with tempfile.TemporaryDirectory() as temp:
+            missing = Path(temp) / "absent.toml"
+            # A configuration that never mentions the field keeps the
+            # historical windows-dotnet default, so upgrading cannot change an
+            # existing rig.
+            default = load_config(missing, {
+                "TITELLA_SLAVE_PLATFORM": "windows",
+                "TITELLA_SLAVE_TRANSPORT": "hid",
+            })
+            self.assertEqual(default.slave_implementation, "auto")
+            explicit = load_config(missing, {
+                "TITELLA_SLAVE_PLATFORM": "windows",
+                "TITELLA_SLAVE_TRANSPORT": "hid",
+                "TITELLA_SLAVE_IMPLEMENTATION": "windows-python",
+            })
+            self.assertEqual(explicit.slave_implementation, "windows-python")
+            dll = load_config(missing, {
+                "TITELLA_SLAVE_PLATFORM": "windows",
+                "TITELLA_SLAVE_TRANSPORT": "hid",
+                "TITELLA_SLAVE_IMPLEMENTATION": "windows-dotnet-dll",
+            })
+            self.assertEqual(dll.slave_implementation, "windows-dotnet-dll")
+
+    def test_slave_implementation_is_validated_against_the_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            missing = Path(temp) / "absent.toml"
+            with self.assertRaisesRegex(ValueError, "slave_implementation"):
+                load_config(missing, {
+                    "TITELLA_SLAVE_PLATFORM": "windows",
+                    "TITELLA_SLAVE_IMPLEMENTATION": "windows-arm",
+                })
+            # Selecting an implementation without a Windows target would be
+            # silently ignored at bootstrap time, so it is refused here.
+            with self.assertRaisesRegex(ValueError, "slave_platform=windows"):
+                load_config(missing, {
+                    "TITELLA_SLAVE_PLATFORM": "linux",
+                    "TITELLA_SLAVE_IMPLEMENTATION": "windows-python",
+                })
+            with self.assertRaisesRegex(ValueError, "slave_platform=windows"):
+                load_config(missing, {
+                    "TITELLA_SLAVE_PLATFORM": "linux",
+                    "TITELLA_SLAVE_IMPLEMENTATION": "windows-dotnet-dll",
+                })
+
     def test_launcher_fields_stay_optional_and_an_empty_text_is_authoritative(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             missing = Path(temp) / "absent.toml"
@@ -291,6 +339,36 @@ class ConfigTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "invalid titella id"):
                 load_config(bad_id, {})
+
+    def test_audit_root_is_global_and_environment_overrides_all_instances(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "config.toml"
+            path.write_text(
+                f'audit_root = "{root / "configured"}"\n'
+                '[titella.one]\nserial_port = "/dev/fake-one"\n'
+                '[titella.two]\nserial_port = "/dev/fake-two"\n',
+                encoding="utf-8",
+            )
+            expected = (root / "environment").resolve()
+            config = load_config(path, {"TITELLA_AUDIT_ROOT": str(expected)})
+            self.assertEqual(config.audit_root, expected)
+            self.assertEqual({item.audit_root for item in config.titellas.values()}, {expected})
+            self.assertFalse(expected.exists())
+
+    def test_audit_root_rejects_a_symlink_instead_of_authorizing_its_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "other"
+            target.mkdir()
+            link = root / "alias"
+            link.symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                load_config(root / "missing.toml", {"TITELLA_AUDIT_ROOT": str(link)})
+            from unittest.mock import patch
+            with patch("titella.config.DEFAULT_AUDIT_ROOT", link):
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    load_config(root / "missing.toml", {})
 
 
 if __name__ == "__main__":

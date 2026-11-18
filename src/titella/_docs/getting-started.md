@@ -69,12 +69,36 @@ The ESP32→slave leg is a separate selection, `slave_transport`:
 
 It is never inferred and never falls back: an old firmware answers
 `slave_transport_unsupported` before any keystroke, and the HID bootstrap
-requires an operator-prepared console (`skip_launch=true`) because it types
-only a short stage-0 line and launches nothing. Switch it with
+requires an operator-prepared console (`skip_launch=true`): it types a short
+launcher and a separate Base64 input line, but opens no window. Switch it with
 `titella_upsert(titella=..., slave_transport="hid")`; switching retires a
 pinned `slave_cdc_port` atomically and is refused while an agent is live
 unless `force=true`. The master's UART to the ESP32 always runs at 2,000,000
 baud, matching the flashed firmware.
+
+Which Windows agent runs on the slave is a third selection,
+`slave_implementation`:
+
+| Value | Payload | Target needs |
+|---|---|---|
+| `auto` (default) | the per-platform default, `windows-dotnet` on Windows | PowerShell 5.1 and .NET Framework 4.7.2 |
+| `windows-dotnet` | C# compiled at run time by the in-box `csc.exe` into `agent.exe`, started directly | same |
+| `windows-dotnet-dll` | the same C# source compiled into `agent.dll`, loaded by a separate Windows PowerShell 5.1 process | same |
+| `windows-python` | stdlib Python zipapp | a Python 3.9+ interpreter on `PATH` |
+
+`auto` is what an existing configuration already gets, so upgrading never
+changes a working rig. The Windows agents speak the same protocol and answer
+the same error codes; only the payload, the process shape and what the target
+must provide differ. Selecting any of them on a non-Windows platform is
+rejected at configuration time rather than ignored at bootstrap time. Switch
+it with `titella_upsert(titella=..., slave_implementation="windows-python")`.
+
+`windows-dotnet-dll` is not a stealth mode: it adds a PowerShell host process
+and the telemetry that comes with it, and an assembly loaded by reflection is
+not the same execution path an image loader validates. It exists so the same
+agent can be measured on a host whose policy refuses an executable image;
+whether the host admits it is decided by that host's controls and observed
+there, never assumed from a successful load elsewhere.
 
 The keyboard layout is a second, independent precondition: `layout` is
 mandatory and the configured `keyboard_layout` is never used as a fallback.

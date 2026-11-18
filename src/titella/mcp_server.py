@@ -9,6 +9,9 @@ from mcp.server.fastmcp import FastMCP, Image
 from pydantic import Field
 
 from . import __version__
+from .audit import AuditError
+from .audit_mcp import AuditFastMCP
+from .audit_tools import register_audit
 from .config import Config, load_config
 from .documentation import SERVER_INSTRUCTIONS, register_documentation
 from .firmware_info import FirmwareInfo
@@ -18,6 +21,8 @@ from .serial_link import SerialLink, TransportError
 
 
 def _error(exc: BaseException) -> dict[str, Any]:
+    if isinstance(exc, AuditError):
+        return {"ok": False, "status": "error", "error": exc.as_dict()}
     if isinstance(exc, TransportError):
         return {"ok": False, "status": "error", "error": exc.as_dict()}
     if isinstance(exc, KeyError):
@@ -71,7 +76,10 @@ def create_server(
 ) -> FastMCP:
     config = config or load_config()
     reg = registry or TitellaRegistry(config, link=link, firmware=firmware)
-    server = FastMCP("titella", instructions=SERVER_INSTRUCTIONS, log_level="ERROR")
+    server = AuditFastMCP(
+        "titella", instructions=SERVER_INSTRUCTIONS, log_level="ERROR",
+        audit_registry=reg,
+    )
     # FastMCP does not propagate `version` to its internal server: without this,
     # initialize announces the MCP SDK version instead of the service version and
     # the wrapper cannot tell an old daemon from a new one.
@@ -79,6 +87,9 @@ def create_server(
     # Documentation tools and resources are static package assets: they are
     # registered once here and never gate on the rig, the lease or the agent.
     register_documentation(server)
+    # audit_* tools resolve archives by audit_id: they work with the agent
+    # off and after the instance left the registry.
+    register_audit(server, reg)
 
     def shutdown() -> None:
         # The slave outlives the shared HTTP daemon. Preserve the correlation
@@ -127,7 +138,14 @@ def create_server(
             "the loader in the firmware Feature mailbox and needs transport=serial, "
             "agent_protocol=serial and slave_platform=windows; switching to hid retires "
             "a pinned slave_cdc_port atomically and is refused while an agent is live "
-            "unless force=True."
+            "unless force=True. slave_implementation selects the Windows agent runtime: "
+            "auto (default) keeps windows-dotnet, windows-dotnet-dll compiles the same "
+            "C# source as a library hosted by a separate Windows PowerShell 5.1 process "
+            "(identical protocol, launcher and HID bootstrap; it exists so the same "
+            "agent can be measured where an executable image is refused), and "
+            "windows-python stages the stdlib Python "
+            "agent, which needs a Python 3.9+ interpreter on the target instead of "
+            "PowerShell 5.1 with the .NET Framework compiler."
         ),
     )
     def titella_upsert(
@@ -148,6 +166,7 @@ def create_server(
         keyboard_layout: str | None = None,
         slave_platform: str | None = None,
         slave_transport: str | None = None,
+        slave_implementation: str | None = None,
         slave_cdc_port: str | None = None,
         terminal_mods: list[str] | str | None = None,
         terminal_key: str | None = None,
@@ -174,6 +193,7 @@ def create_server(
                 keyboard_layout=keyboard_layout,
                 slave_platform=slave_platform,
                 slave_transport=slave_transport,
+                slave_implementation=slave_implementation,
                 slave_cdc_port=slave_cdc_port,
                 terminal_mods=terminal_mods,
                 terminal_key=terminal_key,

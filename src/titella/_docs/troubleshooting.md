@@ -172,11 +172,12 @@ before any keystroke.
 - **No COM port participates.** A HID failure is never a COM problem: do not
   pass `slave_cdc_port` (the bootstrap rejects it) and do not chase COM advice
   for `bootstrap_loader_timeout`. Verify the operator-prepared console
-  received the typed stage-0 line, its active layout matches, and PowerShell
-  5.1 with `FullLanguage` is allowed.
-- **Fixed budgets.** The compressed loader container must fit 32768 bytes
-  and the typed stage-0 line 3328 characters (~26.6 s of pacing); exceeding
-  either fails as `hid_loader_too_large`/`hid_stage0_too_large` before the
+  received both the launcher and its Base64 input line, its active layout
+  matches, and PowerShell 5.1 with `FullLanguage` is allowed.
+- **Fixed budgets.** The compressed loader container must fit 32768 bytes;
+  the launcher, Base64 input and Enter keys share a 3328-character budget
+  (~26.6 s of pacing). Exceeding either fails as
+  `hid_loader_too_large`/`hid_stage0_too_large` before the
   snapshot is published. Shrink the loader instead of extending a timeout.
 - **Busy collection.** One HID consumer at a time: an earlier loader or agent
   that still holds `Local\Titella.Hid.<serial>` answers `hid_busy`. Stop the

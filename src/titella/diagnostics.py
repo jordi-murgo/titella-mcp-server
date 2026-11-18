@@ -65,7 +65,7 @@ def _agent_step(config: Config, agent: dict[str, Any]) -> str:
             "input source of the operator-prepared console with screen(), acquire the lease, "
             "then slave_bootstrap(owner, platform=\"windows\", layout=..., "
             "layout_confirmed=true, skip_launch=true) stages the loader in the ESP32 Feature "
-            "mailbox and types only the stage-0 line. If it fails with "
+            "mailbox and types the launcher and stage-0 input. If it fails with "
             "slave_transport_unsupported the flashed firmware predates the HID data protocol "
             "(1.6.0+): reflash it instead of falling back. If it fails with "
             "bootstrap_loader_timeout the prepared console received nothing or its layout "

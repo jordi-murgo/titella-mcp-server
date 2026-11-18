@@ -11,8 +11,9 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
-
 from .agent_state import AgentGate
+from .audit import AuditError as _AuditError
+from .audit import AuditManager, _CaptureEvidenceSink
 from .bootstrap import BootstrapManager
 from .capability_prober import CapabilityProber
 from .config import (
@@ -97,6 +98,9 @@ class TitellaInstance:
         self.shells = ShellClient(self.serial, self.gate)
         self.files = FilesClient(self.serial, self.gate)
         self.capabilities = CapabilityProber()
+        self._audit_manager: AuditManager | None = None
+        self._audit_unsubscribers: list[Any] = []
+        self._closed = False
 
     @staticmethod
     def _seed_state_dir_if_migrating(config: Config) -> None:
@@ -176,10 +180,52 @@ class TitellaInstance:
         self.bootstrap.config = new_config
 
     def close(self, *, clean: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._audit_manager is not None:
+            self._audit_manager.note_link_state(self.titella_id, "closed")
         self.shells.close()
         self._unsubscribe_agent_state()
         self.files.close()
+        for unsubscribe in self._audit_unsubscribers:
+            try:
+                unsubscribe()
+            except BaseException:
+                pass
+        self._audit_unsubscribers = []
         self.serial.close(clean=clean)
+
+    def attach_audit(self, manager: AuditManager) -> None:
+        """Idempotently connects this instance's sinks to the audit manager."""
+        if self._audit_manager is manager and getattr(self.capture.evidence_sink, "titella_id", None) == self.titella_id:
+            return
+        for unsubscribe in self._audit_unsubscribers:
+            unsubscribe()
+        self._audit_unsubscribers.clear()
+        self._audit_manager = manager
+        self.shells.audit_manager = manager
+        self.shells.audit_titella_id = self.titella_id
+        self.files.audit_manager = manager
+        self.files.audit_titella_id = self.titella_id
+        self.capture.evidence_sink = _CaptureEvidenceSink(manager, self.titella_id)
+        self._audit_unsubscribers.append(
+            self.serial.subscribe("shell", lambda frame: self._audit_shell_frame(frame))
+        )
+        self._audit_unsubscribers.append(
+            self.serial.subscribe_state(self._audit_link_state)
+        )
+
+    def _audit_shell_frame(self, frame: dict[str, Any]) -> bool:
+        manager = self._audit_manager
+        if manager is None:
+            return True
+        return manager.record_shell_frame(self.titella_id, frame)
+
+    def _audit_link_state(self, state: str) -> None:
+        manager = self._audit_manager
+        if manager is not None:
+            manager.note_link_state(self.titella_id, state)
 
     def agent_summary(self) -> dict[str, Any]:
         state = self.bootstrap.status()
@@ -215,6 +261,20 @@ class TitellaInstance:
             capture_age_s=self.capture.age_s(),
         )
         report["titella"] = self.titella_id
+        audit_status = (
+            self._audit_manager.status(self.titella_id)
+            if self._audit_manager is not None else {"status": "inactive"}
+        )
+        if audit_status.get("status") not in {None, "inactive"}:
+            report["audit"] = {
+                "status": audit_status.get("status"),
+                "audit_id": audit_status.get("audit_id"),
+                "run_id": audit_status.get("run_id"),
+                "pending": audit_status.get("pending", []),
+                "gaps": audit_status.get("gaps", 0),
+                "errors": audit_status.get("errors", 0),
+                "fault": audit_status.get("fault"),
+            }
         return report
 
     def summary(self, *, is_default: bool) -> dict[str, Any]:
@@ -242,6 +302,7 @@ class TitellaInstance:
             "ocr_api_key_configured": bool(self.config.ocr_api_key),
             "slave_platform": self.config.slave_platform,
             "slave_transport": self.config.slave_transport,
+            "slave_implementation": self.config.slave_implementation,
             "slave_cdc_port": self.config.slave_cdc_port,
             "terminal_mods": list(self.config.terminal_mods) if self.config.terminal_mods else None,
             "terminal_key": self.config.terminal_key,
@@ -303,6 +364,7 @@ def _candidate_config(
         titella_id=titella_id,
         state_dir=instance_state_dir(state_root, titella_id)
         if titella_id != DEFAULT_TITELLA_ID else state_root,
+        audit_root=Path(str(globals_map.get("audit_root", Config().audit_root))).expanduser().resolve(),
         http_port=http_port,
         default_titella=default_titella,
         selected_path=selected_path,
@@ -321,9 +383,14 @@ class TitellaRegistry:
     ) -> None:
         self._lock = threading.RLock()
         self.root_config = config or load_config()
+        self.audit_root = self.root_config.audit_root
+        self.audit = AuditManager(self.audit_root, selection_lock=self._lock)
+        self.audit.start()
+        self._closed = False
         self._factory = instance_factory or (lambda cfg: TitellaInstance(cfg))
         self.default_titella: str | None = self.root_config.default_titella
         self._instances: dict[str, TitellaInstance] = {}
+        self.audit._instance_exists = lambda tid: tid in self._instances
 
         configured = dict(self.root_config.titellas)
         if not configured:
@@ -331,18 +398,22 @@ class TitellaRegistry:
             configured = {tid: self.root_config}
             self.default_titella = tid
 
+        def _attach(inst: TitellaInstance) -> TitellaInstance:
+            inst.attach_audit(self.audit)
+            return inst
+
         if link is not None or firmware is not None:
             primary_id = self.default_titella or next(iter(configured))
             primary_cfg = configured[primary_id]
-            self._instances[primary_id] = TitellaInstance(
+            self._instances[primary_id] = _attach(TitellaInstance(
                 primary_cfg, link=link, firmware=firmware
-            )
+            ))
             for tid, cfg in configured.items():
                 if tid != primary_id:
-                    self._instances[tid] = self._factory(cfg)
+                    self._instances[tid] = _attach(self._factory(cfg))
         else:
             for tid, cfg in configured.items():
-                self._instances[tid] = self._factory(cfg)
+                self._instances[tid] = _attach(self._factory(cfg))
 
     def resolve(self, titella: str | None = None) -> TitellaInstance:
         with self._lock:
@@ -413,9 +484,13 @@ class TitellaRegistry:
 
     def close_all(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             instances = list(self._instances.values())
         for instance in instances:
             instance.close(clean=False)
+        self.audit.close()
 
     def _read_persisted_model(
         self,
@@ -463,6 +538,8 @@ class TitellaRegistry:
                 # operator never set.
                 if inst.config.slave_transport != "cdc":
                     table["slave_transport"] = inst.config.slave_transport
+                if inst.config.slave_implementation != "auto":
+                    table["slave_implementation"] = inst.config.slave_implementation
                 if inst.config.slave_cdc_port:
                     table["slave_cdc_port"] = inst.config.slave_cdc_port
                 if inst.config.terminal_mods is not None:
@@ -480,10 +557,9 @@ class TitellaRegistry:
             for key in list(globals_map):
                 if key in _INSTANCE_KEYS and key not in {"heartbeat_s", "disconnect_grace_s"}:
                     globals_map.pop(key, None)
-        if "state_dir" not in globals_map:
-            globals_map["state_dir"] = str(self.root_config.state_dir)
-        if "http_port" not in globals_map:
-            globals_map["http_port"] = self.root_config.http_port
+        globals_map.setdefault("state_dir", str(self.root_config.state_dir))
+        globals_map.setdefault("http_port", self.root_config.http_port)
+        globals_map["audit_root"] = str(self.audit_root)
         return globals_map, titellas_map, default_id
 
     def upsert(
@@ -506,6 +582,7 @@ class TitellaRegistry:
         keyboard_layout: str | None = None,
         slave_platform: str | None = None,
         slave_transport: str | None = None,
+        slave_implementation: str | None = None,
         slave_cdc_port: str | None = None,
         terminal_mods: list[str] | str | None = None,
         terminal_key: str | None = None,
@@ -519,6 +596,14 @@ class TitellaRegistry:
             # If the only existing entry is the implicit "default" and the user
             # is registering a named titella pointing at the same serial port,
             # promote "default" in place so the live link and agent are kept.
+            audit_state = self.audit.status(tid)
+            if audit_state.get("status") in {"active", "faulted", "recovery_required"} or self.audit.pending(tid):
+                raise _AuditError(
+                    "audit_busy",
+                    f"titella {tid!r} is associated with audit {audit_state.get('audit_id')!r} "
+                    f"({audit_state.get('status')}); call audit_deactivate first",
+                    False,
+                )
             existing = self._instances.get(tid)
             promoted_from_default = False
             if (
@@ -529,6 +614,8 @@ class TitellaRegistry:
                 def_inst = self._instances[DEFAULT_TITELLA_ID]
                 target_port = serial_port or def_inst.config.serial_port
                 if target_port and target_port == def_inst.config.serial_port:
+                    if self.audit.status(DEFAULT_TITELLA_ID).get("status") != "inactive" or self.audit.pending(DEFAULT_TITELLA_ID):
+                        raise _AuditError("audit_busy", "deactivate the default instance audit before promoting it")
                     existing = def_inst
                     promoted_from_default = True
                     titellas_map[tid] = dict(titellas_map.pop(DEFAULT_TITELLA_ID, {}))
@@ -553,6 +640,7 @@ class TitellaRegistry:
                 "keyboard_layout": keyboard_layout,
                 "slave_platform": slave_platform,
                 "slave_transport": slave_transport,
+                "slave_implementation": slave_implementation,
                 "slave_cdc_port": slave_cdc_port,
                 "terminal_mods": terminal_mods,
                 "terminal_key": terminal_key,
@@ -616,6 +704,7 @@ class TitellaRegistry:
             self.root_config = reloaded_root
             self.default_titella = reloaded_root.default_titella
             instance = self._instances[tid]
+            instance.attach_audit(self.audit)
             return {
                 "ok": True,
                 "status": "updated" if existing is not None else "created",
@@ -633,10 +722,16 @@ class TitellaRegistry:
                     f"unknown titella {tid!r}",
                     False,
                 )
+            if self.audit.status(tid).get("status") != "inactive" or self.audit.pending(tid):
+                raise _AuditError("audit_busy", "deactivate the instance audit before removing it")
             if len(self._instances) <= 1:
-                raise TransportError(
-                    "invalid_argument",
-                    "cannot remove the last registered titella",
+                raise TransportError("invalid_argument", "cannot remove the last registered titella", False)
+            audit_state = self.audit.status(tid)
+            if audit_state.get("status") in {"active", "faulted", "recovery_required"}:
+                raise _AuditError(
+                    "audit_busy",
+                    f"titella {tid!r} is associated with audit {audit_state.get('audit_id')!r} "
+                    f"({audit_state.get('status')}); call audit_deactivate first",
                     False,
                 )
             if instance.gate.ready and not force:

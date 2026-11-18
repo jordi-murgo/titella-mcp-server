@@ -224,11 +224,15 @@ opening a launcher.
 With `slave_transport = "hid"` (selected through `titella_upsert`) the leg
 carries the loader inside the ESP32 Feature `0x11` mailbox: the bootstrap
 first queries a fresh `hid.health` for the firmware identity and protocol,
-stages the compressed loader over the UART, and types only the bounded stage-0
-line. That path rejects an explicit `cdc_port`, a missing `skip_launch`, a
+stages the compressed loader over the UART, then types a launcher and a separate
+Base64 stage-0 input line. Stage 0 reads the latter from console stdin. The
+console shows a dot for each newly accepted mailbox or agent data block, not
+for retries. The launcher may be saved in PowerShell history; input echo,
+transcription, AMSI and script-block logging are separate exposure paths.
+This path rejects an explicit `cdc_port`, a missing `skip_launch`, a
 non-Windows platform and an old firmware (`slave_transport_unsupported`)
 before any keystroke, and fails as `hid_loader_too_large`/`hid_stage0_too_large`
-when the payload or the typed line exceeds its fixed budget. No COM port,
+when the payload or combined typed input exceeds its fixed budget. No COM port,
 clipboard or network participates. The verification procedure is in
 `docs_read("getting-started")` and in the platform-specific bootstrap guides.
 The attestation is a caller claim, not a measured proof: stop instead of

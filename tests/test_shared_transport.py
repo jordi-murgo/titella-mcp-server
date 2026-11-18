@@ -31,10 +31,11 @@ EXPECTED_TOOLS = {
     "remote_terminal_open", "remote_fs_read", "remote_upload", "remote_download",
     "kvm_status", "docs_index", "docs_read",
 }
-DOCUMENT_IDS = {
-    "bootstrap-python", "bootstrap-windows", "getting-started", "mcp-transport",
-    "operation", "serial-protocol", "troubleshooting",
-}
+# Derived from the packaged catalog: no closed seven-document list; the
+# audit documents are required by discovery, not by enumeration here.
+from titella.documentation import list_documents as _list_documents
+DOCUMENT_IDS = {entry["id"] for entry in _list_documents()["documents"]}
+REQUIRED_AUDIT_DOCUMENT_IDS = {"audit-mode", "audit-report-skill", "work-protocol"}
 
 
 def _text_payload(result) -> dict:
@@ -57,13 +58,14 @@ class SharedTransportTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.state = self.root / "state"
         self.port = _free_tcp_port()
-        self.environment = dict(os.environ)
+        self.environment = {key: value for key, value in os.environ.items() if not key.startswith("TITELLA_")}
         self.environment.update({
             # Explicit path: the operator's TOML must not leak into the test.
             # No PYTHONPATH is injected: the wrapper subprocess must resolve
             # the installed packages of this environment.
             "TITELLA_CONFIG": str(self.root / "absent.toml"),
             "TITELLA_STATE_DIR": str(self.state),
+            "TITELLA_AUDIT_ROOT": str(self.root / "audits"),
             "TITELLA_HTTP_PORT": str(self.port),
         })
         self.addCleanup(self._stop_server)
@@ -183,6 +185,12 @@ class SharedTransportTests(unittest.TestCase):
         index = _text_payload(await session.call_tool("docs_index", {}))
         ids = [entry["id"] for entry in index["documents"]]
         self.assertEqual(ids, sorted(DOCUMENT_IDS))
+        self.assertLessEqual(REQUIRED_AUDIT_DOCUMENT_IDS, set(ids))
+        for audit_id in sorted(REQUIRED_AUDIT_DOCUMENT_IDS):
+            loaded_audit = _text_payload(
+                await session.call_tool("docs_read", {"document_id": audit_id})
+            )
+            self.assertTrue(loaded_audit["content"].strip(), audit_id)
         windows = next(entry for entry in index["documents"]
                        if entry["id"] == "bootstrap-windows")
         self.assertEqual(windows["source"], "titella-slave-assets")
@@ -223,6 +231,10 @@ class SharedTransportTests(unittest.TestCase):
         body = read.contents[0]
         self.assertEqual(body.mimeType, "text/markdown")
         self.assertEqual(body.text, loaded["content"])
+        for entry in index["documents"]:
+            loaded_entry = _text_payload(await session.call_tool("docs_read", {"document_id": entry["id"]}))
+            resource = await session.read_resource(entry["uri"])
+            self.assertEqual(resource.contents[0].text, loaded_entry["content"])
 
     def test_concurrent_wrappers_share_one_server_and_restart_after_failure(self) -> None:
         async def concurrent_clients() -> list[set[str]]:

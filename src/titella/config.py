@@ -16,6 +16,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 
 DEFAULT_CONFIG_PATH = Path("~/.config/titella/config.toml").expanduser()
+DEFAULT_AUDIT_ROOT = Path(os.path.abspath(Path("~/.local/state/titella/audits").expanduser()))
 DEFAULT_TITELLA_ID = "default"
 _TITELLA_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 
@@ -40,6 +41,7 @@ ENV_TO_KEY = {
     "TITELLA_OCR_MODEL": "ocr_model",
     "TITELLA_OCR_TIMEOUT_S": "ocr_timeout_s",
     "TITELLA_STATE_DIR": "state_dir",
+    "TITELLA_AUDIT_ROOT": "audit_root",
     "TITELLA_KEYBOARD_LAYOUT": "keyboard_layout",
     "TITELLA_HEARTBEAT_S": "heartbeat_s",
     "TITELLA_DISCONNECT_GRACE_S": "disconnect_grace_s",
@@ -47,6 +49,7 @@ ENV_TO_KEY = {
     "TITELLA_SLAVE_PLATFORM": "slave_platform",
     "TITELLA_SLAVE_TRANSPORT": "slave_transport",
     "TITELLA_SLAVE_CDC_PORT": "slave_cdc_port",
+    "TITELLA_SLAVE_IMPLEMENTATION": "slave_implementation",
     "TITELLA_TERMINAL_MODS": "terminal_mods",
     "TITELLA_TERMINAL_KEY": "terminal_key",
     "TITELLA_LAUNCHER_TEXT": "launcher_text",
@@ -76,6 +79,7 @@ _INSTANCE_KEYS = frozenset({
     "keyboard_layout",
     "slave_platform",
     "slave_transport",
+    "slave_implementation",
     "slave_cdc_port",
     "terminal_mods",
     "terminal_key",
@@ -142,6 +146,7 @@ class Config:
     ocr_model: str | None = None
     ocr_timeout_s: float = 30.0
     state_dir: Path = Path(tempfile.gettempdir()) / "titella"
+    audit_root: Path = DEFAULT_AUDIT_ROOT
     keyboard_layout: str = "es_ES"
     heartbeat_s: float = 5.0
     disconnect_grace_s: float = 30.0
@@ -160,6 +165,12 @@ class Config:
     # requires transport="serial", agent_protocol="serial" and a Windows
     # slave with no CDC port pinned.
     slave_transport: str = "cdc"
+    # Which Windows agent the bootstrap stages. "auto" keeps the per-platform
+    # default (windows-dotnet); "windows-python" stages the stdlib Python
+    # agent, which needs a Python 3.9+ interpreter on the target instead of
+    # PowerShell 5.1 with .NET Framework compilation. Only the Windows
+    # platform has more than one implementation.
+    slave_implementation: str = "auto"
     # Optional launcher overrides for the configured default slave platform,
     # or for Linux where no portable terminal shortcut exists. An explicitly
     # selected macOS or Windows target uses its built-in profile so a shortcut
@@ -270,11 +281,24 @@ def _optional_text(value: Any) -> str | None:
     return text or None
 
 
+def _resolve_audit_root(value: Any) -> Path:
+    if value is None:
+        value = DEFAULT_AUDIT_ROOT
+    text = str(value).strip()
+    if not text:
+        raise ValueError("audit_root cannot be empty")
+    path = Path(text).expanduser()
+    if path.is_symlink():
+        raise ValueError("audit_root must not be a symlink")
+    return path.resolve(strict=False)
+
+
 def _build_single_config(
     values: Mapping[str, Any],
     *,
     titella_id: str,
     state_dir: Path,
+    audit_root: Path = DEFAULT_AUDIT_ROOT,
     http_port: int,
     default_titella: str | None,
     selected_path: Path,
@@ -343,6 +367,12 @@ def _build_single_config(
     slave_transport = str(values.get("slave_transport", "cdc")).strip().lower()
     if slave_transport not in {"cdc", "hid"}:
         raise ValueError("slave_transport must be cdc or hid")
+    slave_implementation = str(values.get("slave_implementation", "auto")).strip().lower()
+    if slave_implementation not in {
+            "auto", "windows-dotnet", "windows-dotnet-dll", "windows-python"}:
+        raise ValueError(
+            "slave_implementation must be auto, windows-dotnet, "
+            "windows-dotnet-dll or windows-python")
     slave_cdc_port = values.get("slave_cdc_port")
     if slave_cdc_port is not None:
         slave_cdc_port = str(slave_cdc_port).strip() or None
@@ -361,6 +391,12 @@ def _build_single_config(
             raise ValueError("slave_transport=hid requires slave_platform=windows")
         if slave_cdc_port is not None:
             raise ValueError("slave_transport=hid cannot carry slave_cdc_port")
+    # An explicitly selected implementation is only meaningful on Windows: a
+    # POSIX profile has exactly one agent, and accepting the field there would
+    # silently ignore a configuration the operator believes is in force.
+    if slave_implementation != "auto" and slave_platform != "windows":
+        raise ValueError(
+            "slave_implementation is only selectable with slave_platform=windows")
 
     # Launcher fields stay optional: None defers to the platform profile, an
     # explicit empty string (launcher_text="") is authoritative.
@@ -410,12 +446,14 @@ def _build_single_config(
         ocr_model=ocr_model,
         ocr_timeout_s=ocr_timeout_s,
         state_dir=state_dir,
+        audit_root=audit_root,
         keyboard_layout=layout,
         heartbeat_s=heartbeat,
         disconnect_grace_s=grace,
         http_port=http_port,
         slave_platform=slave_platform,
         slave_transport=slave_transport,
+        slave_implementation=slave_implementation,
         slave_cdc_port=slave_cdc_port,
         terminal_mods=terminal_mods,
         terminal_key=terminal_key,
@@ -461,8 +499,8 @@ def load_config(
     base_state_dir = Path(
         values.get("state_dir", Path(tempfile.gettempdir()) / "titella")
     ).expanduser()
+    audit_root = _resolve_audit_root(values.get("audit_root"))
     http_port = _integer(values.get("http_port", 8765), "http_port", 1024, 65535)
-
     default_titella_raw = values.get("default_titella")
     default_titella: str | None = None
     if default_titella_raw is not None and str(default_titella_raw).strip():
@@ -474,6 +512,7 @@ def load_config(
             values,
             titella_id=chosen_id,
             state_dir=instance_state_dir(base_state_dir, chosen_id) if chosen_id != DEFAULT_TITELLA_ID else base_state_dir,
+            audit_root=audit_root,
             http_port=http_port,
             default_titella=chosen_id,
             selected_path=selected,
@@ -504,6 +543,7 @@ def load_config(
             merged,
             titella_id=tid,
             state_dir=sub_state,
+            audit_root=audit_root,
             http_port=http_port,
             default_titella=default_titella,
             selected_path=selected,
@@ -514,6 +554,7 @@ def load_config(
     return replace(
         primary,
         state_dir=base_state_dir,
+        audit_root=audit_root,
         titella_id=primary_id,
         default_titella=default_titella,
         titellas=built,
@@ -546,6 +587,7 @@ def save_titella_config(
     lines: list[str] = []
     ordered_globals = (
         "state_dir",
+        "audit_root",
         "http_port",
         "heartbeat_s",
         "disconnect_grace_s",
@@ -572,6 +614,7 @@ def save_titella_config(
         "keyboard_layout",
         "slave_platform",
         "slave_transport",
+        "slave_implementation",
         "slave_cdc_port",
         "terminal_mods",
         "terminal_key",
@@ -613,6 +656,7 @@ def save_titella_config(
         "keyboard_layout",
         "slave_platform",
         "slave_transport",
+        "slave_implementation",
         "slave_cdc_port",
         "terminal_mods",
         "terminal_key",
